@@ -100,13 +100,18 @@ describe('useComfyUI', () => {
     expect(error.value).toBe('Network Error')
   })
 
-  it('cancel 调用后：isGenerating 变为 false', async () => {
-    global.fetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ prompt_id: 'test-id-789' }),
-    })
+  it('cancel 调用后：isGenerating 变为 false 且轮询停止', async () => {
+    global.fetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ prompt_id: 'test-id-789' }),
+      })
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ 'test-id-789': { outputs: {}, status: { completed: false } } }),
+      })
 
-    const { isGenerating, cancel, submit } = useComfyUI({
+    const { isGenerating, result, error, cancel, submit } = useComfyUI({
       baseURL: 'http://127.0.0.1:8188',
       pollInterval: 1000,
       pollMaxTries: 5,
@@ -117,5 +122,30 @@ describe('useComfyUI', () => {
 
     cancel()
     expect(isGenerating.value).toBe(false)
+
+    // 确认取消后定时器不再触发状态变更
+    await vi.runAllTimersAsync()
+    expect(result.value).toBeNull()
+    expect(error.value).toBeNull()
+  })
+
+  it('POST /prompt 返回非 2xx 时：设置错误信息', async () => {
+    global.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    })
+
+    const { isGenerating, result, error, submit } = useComfyUI({
+      baseURL: 'http://127.0.0.1:8188',
+      pollInterval: 1000,
+      pollMaxTries: 5,
+    })
+
+    await submit({ '3': {} })
+
+    expect(isGenerating.value).toBe(false)
+    expect(result.value).toBeNull()
+    expect(error.value).toBe('提交失败：500')
   })
 })

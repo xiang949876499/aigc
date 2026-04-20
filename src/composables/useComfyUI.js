@@ -9,12 +9,14 @@ export function useComfyUI(config = {}) {
   const error = ref(null)
 
   let timerId = null
+  let cancelled = false
 
   function cancel() {
     if (timerId !== null) {
       clearInterval(timerId)
       timerId = null
     }
+    cancelled = true
     isGenerating.value = false
   }
 
@@ -24,6 +26,8 @@ export function useComfyUI(config = {}) {
   }
 
   async function submit(workflow) {
+    cancel()  // stop any prior poll
+    cancelled = false
     isGenerating.value = true
     result.value = null
     error.value = null
@@ -46,8 +50,14 @@ export function useComfyUI(config = {}) {
     let tries = 0
     await new Promise((resolve) => {
       timerId = setInterval(async () => {
+        if (cancelled) {
+          clearInterval(timerId)
+          timerId = null
+          resolve()
+          return
+        }
         tries++
-        if (tries > cfg.pollMaxTries) {
+        if (tries >= cfg.pollMaxTries) {
           stopWithError('生成超时，请重试')
           resolve()
           return
@@ -55,6 +65,7 @@ export function useComfyUI(config = {}) {
 
         try {
           const res = await fetch(`${cfg.baseURL}/history/${promptId}`)
+          if (cancelled) { resolve(); return }
           if (!res.ok) throw new Error(`查询失败：${res.status}`)
           const data = await res.json()
           const record = data[promptId]
@@ -73,7 +84,7 @@ export function useComfyUI(config = {}) {
           if (nodeWithImages) {
             const img = nodeWithImages.images[0]
             result.value = {
-              imageURL: `${cfg.baseURL}/view?filename=${img.filename}&subfolder=${img.subfolder}&type=${img.type}`,
+              imageURL: `${cfg.baseURL}/view?filename=${encodeURIComponent(img.filename)}&subfolder=${encodeURIComponent(img.subfolder)}&type=${encodeURIComponent(img.type)}`,
             }
             cancel()
             resolve()
