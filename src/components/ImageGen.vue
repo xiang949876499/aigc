@@ -146,7 +146,7 @@ function downloadResult() {
 
 function addToTemplate() {
   if (result.value) {
-    templates.value.unshift({ id: Date.now(), color: result.value.color })
+    templates.value.unshift({ id: Date.now(), imageURL: result.value.imageURL })
   }
 }
 </script>
@@ -191,7 +191,7 @@ function addToTemplate() {
               v-for="t in templates"
               :key="t.id"
               class="template-card"
-              :style="{ background: t.color }"
+              :style="t.imageURL ? { backgroundImage: `url(${t.imageURL})`, backgroundSize: 'cover', backgroundPosition: 'center' } : { background: t.color }"
             />
           </div>
         </div>
@@ -344,7 +344,7 @@ function addToTemplate() {
               v-for="h in history"
               :key="h.id"
               class="history-card"
-              :style="{ background: h.color }"
+              :style="h.imageURL ? { backgroundImage: `url(${h.imageURL})`, backgroundSize: 'cover', backgroundPosition: 'center' } : { background: h.color }"
             />
           </div>
         </div>
