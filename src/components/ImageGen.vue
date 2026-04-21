@@ -94,8 +94,24 @@ function togglePanel(name) {
   activePanel.value = activePanel.value === name ? null : name
 }
 
+// 定义描述性选项字段
+const descriptiveFields = ['style', 'quality', 'angle', 'color', 'lighting']
+
 function selectOption(field, value) {
   selected[field] = value
+
+  // 如果是描述性选项，追加到prompt
+  if (descriptiveFields.includes(field)) {
+    const currentPrompt = prompt.value.trim()
+    if (currentPrompt) {
+      // 如果已有内容，添加逗号分隔
+      prompt.value = currentPrompt + '，' + value
+    } else {
+      // 如果为空，直接添加
+      prompt.value = value
+    }
+  }
+
   activePanel.value = null
 }
 
