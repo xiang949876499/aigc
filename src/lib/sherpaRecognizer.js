@@ -1,5 +1,8 @@
 import sherpa_onnx from 'sherpa-onnx'
 
+const SAMPLE_RATE = 16000
+const FEATURE_DIM = 80
+
 export default class SherpaRecognizer {
   constructor() {
     this.recognizer = null
@@ -7,10 +10,14 @@ export default class SherpaRecognizer {
   }
 
   async initialize(modelFiles) {
+    if (!modelFiles?.encoder || !modelFiles?.decoder || !modelFiles?.joiner || !modelFiles?.tokens) {
+      throw new Error('Missing required model files (encoder, decoder, joiner, tokens)')
+    }
+
     const config = {
       featConfig: {
-        sampleRate: 16000,
-        featureDim: 80
+        sampleRate: SAMPLE_RATE,
+        featureDim: FEATURE_DIM
       },
       modelConfig: {
         transducer: {
@@ -25,7 +32,12 @@ export default class SherpaRecognizer {
       }
     }
 
-    this.recognizer = new sherpa_onnx.OnlineRecognizer(config)
+    try {
+      this.recognizer = new sherpa_onnx.OnlineRecognizer(config)
+    } catch (e) {
+      this.recognizer = null
+      throw new Error(`Failed to create recognizer: ${e.message}`)
+    }
   }
 
   createStream() {
@@ -39,7 +51,7 @@ export default class SherpaRecognizer {
     if (!this.stream) {
       throw new Error('Stream not created')
     }
-    this.stream.acceptWaveform(16000, samples)
+    this.stream.acceptWaveform(SAMPLE_RATE, samples)
   }
 
   isReady() {
@@ -64,6 +76,9 @@ export default class SherpaRecognizer {
   }
 
   reset() {
+    if (!this.recognizer) {
+      throw new Error('Recognizer not initialized')
+    }
     if (this.stream) {
       this.stream.free()
     }
