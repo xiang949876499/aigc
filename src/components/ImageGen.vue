@@ -22,11 +22,13 @@ const {
   stopListening: stopSpeechListening
 } = useSpeechRecognition()
 
-// 监听语音识别结果，追加到 prompt
+// 监听语音识别结果，追加到 prompt（只追加增量）
+let lastTranscriptLength = 0
 watch(speechTranscript, (newVal) => {
-  if (newVal) {
-    // 如果 prompt 为空，直接设置；否则追加
-    prompt.value = prompt.value ? prompt.value + ' ' + newVal : newVal
+  if (newVal && newVal.length > lastTranscriptLength) {
+    const delta = newVal.slice(lastTranscriptLength)
+    prompt.value = prompt.value ? prompt.value + delta : newVal
+    lastTranscriptLength = newVal.length
   }
 })
 
@@ -2176,6 +2178,7 @@ async function generate() {
 
 .spin {
   animation: spin 1s linear infinite;
+  display: block;
 }
 
 @keyframes pulse {
@@ -2305,11 +2308,6 @@ async function generate() {
   cursor: not-allowed;
 }
 
-.spin {
-  animation: spin 1s linear infinite;
-  display: block;
-}
-
 .preview-mask {
   position: fixed;
   inset: 0;
@@ -2415,11 +2413,6 @@ async function generate() {
   display: flex;
   justify-content: center;
   gap: 10px;
-}
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
 }
 
 @media (max-width: 900px) {
