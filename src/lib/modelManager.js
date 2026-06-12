@@ -1,3 +1,11 @@
+/**
+ * @typedef {Object} ModelFiles
+ * @property {ArrayBuffer} encoder - Encoder model file
+ * @property {ArrayBuffer} decoder - Decoder model file
+ * @property {ArrayBuffer} joiner - Joiner model file
+ * @property {string} tokens - Tokens file content
+ */
+
 const DB_NAME = 'sherpa-onnx-cache'
 const DB_VERSION = 1
 const STORE_NAME = 'models'
@@ -10,8 +18,22 @@ const MODEL_FILES = {
   tokens: `${MODEL_DIR}/tokens.txt`
 }
 
+/** Check if IndexedDB is available */
+function isIndexedDBAvailable() {
+  try {
+    return typeof indexedDB !== 'undefined'
+  } catch {
+    return false
+  }
+}
+
 function openDB() {
   return new Promise((resolve, reject) => {
+    if (!isIndexedDBAvailable()) {
+      reject(new Error('IndexedDB is not available'))
+      return
+    }
+
     const request = indexedDB.open(DB_NAME, DB_VERSION)
 
     request.onerror = () => reject(request.error)
@@ -26,7 +48,15 @@ function openDB() {
   })
 }
 
+/**
+ * Check if model is cached in IndexedDB
+ * @returns {Promise<boolean>}
+ */
 export async function isCached() {
+  if (!isIndexedDBAvailable()) {
+    return false
+  }
+
   try {
     const db = await openDB()
     const tx = db.transaction(STORE_NAME, 'readonly')
@@ -37,11 +67,16 @@ export async function isCached() {
       request.onsuccess = () => resolve(!!request.result)
       request.onerror = () => reject(request.error)
     })
-  } catch {
+  } catch (e) {
+    console.debug('isCached check failed:', e)
     return false
   }
 }
 
+/**
+ * Load model files with IndexedDB caching
+ * @returns {Promise<ModelFiles>}
+ */
 export async function loadModel() {
   // Check cache first
   const cached = await loadFromCache()
@@ -54,8 +89,8 @@ export async function loadModel() {
   console.log('Loading model from files...')
   const model = await loadFromFiles()
 
-  // Save to cache
-  await saveToCache(model)
+  // Save to cache (non-blocking, cache failure is not critical)
+  saveToCache(model).catch(e => console.debug('Cache save failed:', e))
   console.log('Model cached for future use')
 
   return model
@@ -89,6 +124,10 @@ async function fetchText(url) {
 }
 
 async function loadFromCache() {
+  if (!isIndexedDBAvailable()) {
+    return null
+  }
+
   try {
     const db = await openDB()
     const tx = db.transaction(STORE_NAME, 'readonly')
@@ -99,39 +138,36 @@ async function loadFromCache() {
       request.onsuccess = () => resolve(request.result || null)
       request.onerror = () => reject(request.error)
     })
-  } catch {
+  } catch (e) {
+    console.debug('Cache load failed:', e)
     return null
   }
 }
 
 async function saveToCache(model) {
-  try {
-    const db = await openDB()
-    const tx = db.transaction(STORE_NAME, 'readwrite')
-    const store = tx.objectStore(STORE_NAME)
+  const db = await openDB()
+  const tx = db.transaction(STORE_NAME, 'readwrite')
+  const store = tx.objectStore(STORE_NAME)
 
-    return new Promise((resolve, reject) => {
-      const request = store.put(model, 'model-data')
-      request.onsuccess = () => resolve()
-      request.onerror = () => reject(request.error)
-    })
-  } catch (error) {
-    console.warn('Failed to cache model:', error)
-  }
+  return new Promise((resolve, reject) => {
+    const request = store.put(model, 'model-data')
+    request.onsuccess = () => resolve()
+    request.onerror = () => reject(request.error)
+  })
 }
 
+/**
+ * Clear cached model from IndexedDB
+ * @returns {Promise<void>}
+ */
 export async function clearCache() {
-  try {
-    const db = await openDB()
-    const tx = db.transaction(STORE_NAME, 'readwrite')
-    const store = tx.objectStore(STORE_NAME)
+  const db = await openDB()
+  const tx = db.transaction(STORE_NAME, 'readwrite')
+  const store = tx.objectStore(STORE_NAME)
 
-    return new Promise((resolve, reject) => {
-      const request = store.delete('model-data')
-      request.onsuccess = () => resolve()
-      request.onerror = () => reject(request.error)
-    })
-  } catch (error) {
-    console.warn('Failed to clear cache:', error)
-  }
+  return new Promise((resolve, reject) => {
+    const request = store.delete('model-data')
+    request.onsuccess = () => resolve()
+    request.onerror = () => reject(request.error)
+  })
 }
