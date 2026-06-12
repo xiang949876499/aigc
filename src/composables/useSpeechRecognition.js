@@ -2,6 +2,10 @@ import { ref, onBeforeUnmount } from 'vue'
 import { loadModel } from '../lib/modelManager.js'
 import SherpaRecognizer from '../lib/sherpaRecognizer.js'
 
+const SAMPLE_RATE = 16000
+const BUFFER_SIZE = 4096
+const CHANNELS = 1
+
 export function useSpeechRecognition() {
   const isListening = ref(false)
   const isSupported = ref(false)
@@ -13,17 +17,16 @@ export function useSpeechRecognition() {
   let audioContext = null
   let mediaStream = null
   let processor = null
+  let isDisposed = false
 
   // Check if WebAssembly is supported
   function checkSupport() {
     try {
-      if (typeof WebAssembly === 'object') {
-        return true
-      }
-    } catch (e) {
-      // WebAssembly not supported
+      return typeof WebAssembly === 'object'
+    } catch {
+      console.debug('WebAssembly support check failed')
+      return false
     }
-    return false
   }
 
   // Initialize the recognizer
@@ -68,46 +71,51 @@ export function useSpeechRecognition() {
     error.value = null
 
     try {
+      // Create recognition stream
+      recognizer.createStream()
+
       // Get microphone access
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          sampleRate: 16000,
-          channelCount: 1,
+          sampleRate: SAMPLE_RATE,
+          channelCount: CHANNELS,
           echoCancellation: true,
           noiseSuppression: true
         }
       })
 
       // Create audio context
-      audioContext = new AudioContext({ sampleRate: 16000 })
+      audioContext = new AudioContext({ sampleRate: SAMPLE_RATE })
 
       // Create audio source
       const source = audioContext.createMediaStreamSource(mediaStream)
 
       // Create script processor
-      processor = audioContext.createScriptProcessor(4096, 1, 1)
-
-      // Create recognition stream
-      recognizer.createStream()
+      processor = audioContext.createScriptProcessor(BUFFER_SIZE, CHANNELS, CHANNELS)
 
       // Process audio data
       processor.onaudioprocess = (e) => {
         if (!isListening.value) return
 
-        const samples = e.inputBuffer.getChannelData(0)
+        try {
+          const samples = e.inputBuffer.getChannelData(0)
 
-        // Feed audio to recognizer
-        recognizer.acceptWaveform(samples)
+          // Feed audio to recognizer
+          recognizer.acceptWaveform(samples)
 
-        // Check if ready to decode
-        if (recognizer.isReady()) {
-          recognizer.decode()
-        }
+          // Check if ready to decode
+          if (recognizer.isReady()) {
+            recognizer.decode()
+          }
 
-        // Get result
-        const result = recognizer.getResult()
-        if (result && result.text) {
-          transcript.value = result.text
+          // Get result
+          const result = recognizer.getResult()
+          if (result && result.text) {
+            transcript.value = result.text
+          }
+        } catch (e) {
+          console.error('Audio processing error:', e)
+          error.value = '语音处理过程中发生错误'
         }
       }
 
@@ -121,6 +129,8 @@ export function useSpeechRecognition() {
 
       if (e.name === 'NotAllowedError' || e.message.includes('Permission denied')) {
         error.value = '请允许麦克风权限以使用语音识别'
+      } else if (e.message.includes('Recognizer not initialized') || e.message.includes('Stream not created')) {
+        error.value = '语音识别器未就绪，请刷新页面重试'
       } else {
         error.value = '无法访问麦克风，请检查设备设置'
       }
@@ -140,14 +150,18 @@ export function useSpeechRecognition() {
   }
 
   // Cleanup resources
-  function cleanup() {
+  async function cleanup() {
     if (processor) {
       processor.disconnect()
       processor = null
     }
 
     if (audioContext) {
-      audioContext.close()
+      try {
+        await audioContext.close()
+      } catch (e) {
+        console.debug('AudioContext close error:', e)
+      }
       audioContext = null
     }
 
@@ -163,7 +177,10 @@ export function useSpeechRecognition() {
 
   // Cleanup on unmount
   onBeforeUnmount(() => {
-    stopListening()
+    isDisposed = true
+    if (isListening.value) {
+      isListening.value = false
+    }
     if (recognizer) {
       recognizer.free()
       recognizer = null
