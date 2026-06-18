@@ -1,12 +1,32 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import FigmaIcon from './FigmaIcon.vue'
 import ToolbarPanel from './ToolbarPanel.vue'
+import figmaResultPreview from '../assets/figma-result-preview.png'
+import figmaTemplate1 from '../assets/figma-template-1.png'
+import figmaTemplate2 from '../assets/figma-template-2.png'
 import { useComfyUI } from '../composables/useComfyUI.js'
 import { useSpeechRecognition } from '../composables/useSpeechRecognition.js'
 import comfyuiConfig from '../config/comfyui.js'
+import {
+  createComfyUISettingsDraft,
+  loadComfyUISettings,
+  resetComfyUISettings,
+  saveComfyUISettings,
+} from '../config/comfyuiSettings.js'
+import { getWorkflowKeyForSubmit, isSourceImageRequiredForSubmit } from '../workflows/imageRequirements.js'
 import workflows from '../workflows/index.js'
 
-const { isGenerating, result, error, submit, uploadImage, cancel } = useComfyUI()
+const {
+  isGenerating,
+  result,
+  error,
+  submit,
+  uploadImage,
+  cancel,
+  getPromptResult,
+  findPromptResultByText,
+} = useComfyUI()
 
 const prompt = ref('')
 
@@ -40,7 +60,13 @@ function toggleSpeechRecognition() {
     startListening()
   }
 }
+const speechButtonTitle = computed(() => {
+  if (isListening.value) return '停止录音'
+  if (isSpeechLoading.value) return '语音处理中...'
+  return '语音输入'
+})
 const activePanel = ref(null)
+const activeView = ref('aigc')
 const conversationRef = ref(null)
 const sourceImageInputRef = ref(null)
 const sourceImageFile = ref(null)
@@ -48,6 +74,12 @@ const sourceImagePreview = ref('')
 const itemImageInputRef = ref(null)
 const itemImageFile = ref(null)
 const itemImagePreview = ref('')
+const comfySettings = reactive(loadComfyUISettings())
+const settingsDraft = reactive({ ...comfySettings })
+const settingsStatus = ref('')
+
+const activeComfyImageBaseURL = computed(() => comfySettings.imageBaseURL || comfyuiConfig.baseURL)
+const activeComfyVideoBaseURL = computed(() => comfySettings.videoBaseURL || comfyuiConfig.videoBaseURL)
 
 const IMAGE_SOURCE_MODES = new Set(['image_to_image', 'image_to_video', 'replace_item'])
 const ITEM_SOURCE_MODES = new Set(['replace_item'])
@@ -58,8 +90,8 @@ const MESSAGES_KEY = 'aigc_messages'
 const IMAGE_DB_NAME = 'aigc_images'
 const IMAGE_DB_STORE = 'blobs'
 const DEFAULT_TEMPLATES = [
-  { id: 'tpl-1', color: '#5B8FD4' },
-  { id: 'tpl-2', color: '#8B5CF6' },
+  { id: 'tpl-1', imageURL: figmaTemplate1 },
+  { id: 'tpl-2', imageURL: figmaTemplate2 },
   { id: 'tpl-3', color: '#5BB8D4' },
   { id: 'tpl-4', color: '#C9A84C' },
 ]
@@ -71,6 +103,9 @@ const localObjectURLById = new Map()
 
 function openImageDB() {
   if (imageDBPromise) return imageDBPromise
+  if (typeof indexedDB === 'undefined') {
+    return Promise.reject(new Error('indexedDB unavailable'))
+  }
   imageDBPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(IMAGE_DB_NAME, 1)
     req.onupgradeneeded = () => {
@@ -87,6 +122,7 @@ function openImageDB() {
 
 async function idbPutBlob(key, blob) {
   if (!key || !blob) return
+  if (typeof indexedDB === 'undefined') return
   const db = await openImageDB()
   await new Promise((resolve, reject) => {
     const tx = db.transaction(IMAGE_DB_STORE, 'readwrite')
@@ -98,6 +134,7 @@ async function idbPutBlob(key, blob) {
 
 async function idbGetBlob(key) {
   if (!key) return null
+  if (typeof indexedDB === 'undefined') return null
   const db = await openImageDB()
   return await new Promise((resolve, reject) => {
     const tx = db.transaction(IMAGE_DB_STORE, 'readonly')
@@ -141,8 +178,23 @@ function normalizeTemplates(rawTemplates) {
     .map((item) => {
       const next = {}
       const id = item.id != null ? String(item.id) : makeUid('tpl')
-      if (typeof item.imageURL === 'string' && item.imageURL) {
-        next.imageURL = item.imageURL
+      if (id === 'tpl-1' && !item.imageURL) {
+        next.imageURL = figmaTemplate1
+      } else if (id === 'tpl-2' && !item.imageURL) {
+        next.imageURL = figmaTemplate2
+      }
+      const imageURL = typeof item.imageURL === 'string' && item.imageURL
+        ? item.imageURL
+        : (typeof item.localAssetURL === 'string' ? item.localAssetURL : '')
+      if (imageURL) {
+        next.imageURL = imageURL
+        if (typeof item.localAssetURL === 'string' && item.localAssetURL) {
+          next.localAssetURL = item.localAssetURL
+          next.localImageURL = item.localAssetURL
+        }
+        if (typeof item.localAssetPath === 'string' && item.localAssetPath) {
+          next.localAssetPath = item.localAssetPath
+        }
         // 保留 IndexedDB 中的缓存 key
         if (typeof item.imageId === 'string' && item.imageId) {
           next.imageId = item.imageId
@@ -194,10 +246,15 @@ function normalizeMessages(rawMessages) {
       const imageURL = typeof item.imageURL === 'string' ? item.imageURL : ''
       const errorText = typeof item.error === 'string' ? item.error : ''
       const imageId = typeof item.imageId === 'string' ? item.imageId : ''
-      const mediaType = item.mediaType === 'video' ? 'video' : 'image'
+      const localAssetURL = typeof item.localAssetURL === 'string' ? item.localAssetURL : ''
+      const localAssetPath = typeof item.localAssetPath === 'string' ? item.localAssetPath : ''
+      const promptId = typeof item.promptId === 'string' ? item.promptId : ''
+      const promptBaseURL = typeof item.promptBaseURL === 'string' ? item.promptBaseURL : ''
+      const mediaURL = localAssetURL || imageURL
+      const mediaType = item.mediaType === 'video' || isVideoURL(mediaURL) ? 'video' : 'image'
       let status = item.status
       if (status !== 'generating' && status !== 'done' && status !== 'error') {
-        status = imageURL ? 'done' : (errorText ? 'error' : 'done')
+        status = mediaURL ? 'done' : (errorText ? 'error' : 'done')
       }
 
       return {
@@ -206,7 +263,12 @@ function normalizeMessages(rawMessages) {
         status,
         imageURL,
         imageId,
-        mediaType: imageURL && mediaType === 'video' ? 'video' : 'image',
+        localImageURL: localAssetURL,
+        localAssetURL,
+        localAssetPath,
+        promptId,
+        promptBaseURL,
+        mediaType: mediaURL && mediaType === 'video' ? 'video' : 'image',
         error: errorText,
         createdAt,
       }
@@ -217,7 +279,7 @@ function normalizeMessages(rawMessages) {
 const templates = ref(normalizeTemplates(readStorage(TEMPLATES_KEY, DEFAULT_TEMPLATES)))
 const messages = ref(normalizeMessages(readStorage(MESSAGES_KEY, [])))
 const history = computed(() => messages.value
-  .filter((item) => item.role === 'assistant' && (item.localImageURL || item.imageURL)))
+  .filter((item) => item.role === 'assistant' && (item.localImageURL || item.localAssetURL || item.imageURL)))
 
 watch(templates, (val) => {
   try {
@@ -265,12 +327,51 @@ const requiresSourceImage = computed(() => IMAGE_SOURCE_MODES.has(selected.mode)
 const requiresItemImage = computed(() => ITEM_SOURCE_MODES.has(selected.mode))
 
 const modeButtons = [
-  { key: 'text_to_image', label: '文生图', workflowKey: 'textToImage' },
-  { key: 'image_to_image', label: '图生图', workflowKey: 'imageToImage' },
-  { key: 'text_to_video', label: '文生视频', workflowKey: 'textToVideo' },
-  { key: 'image_to_video', label: '图生视频', workflowKey: 'imageToVideo' },
-  { key: 'replace_item', label: '替换物品', workflowKey: 'outfitChange' },
+  { key: 'text_to_image', label: '文生图' },
+  { key: 'image_to_image', label: '图生图' },
+  { key: 'text_to_video', label: '文生视频' },
+  { key: 'image_to_video', label: '图生视频' },
+  { key: 'replace_item', label: '替换物品' },
 ]
+
+const MODE_UI = {
+  text_to_image: { label: '文生图', icon: 'textImage' },
+  image_to_image: { label: '图生图', icon: 'imageImage' },
+  text_to_video: { label: '文生视频', icon: 'textVideo' },
+  image_to_video: { label: '图生视频', icon: 'imageVideo' },
+  replace_item: { label: '替换物品', icon: 'more' },
+}
+
+const ratioOptions = [
+  { key: '1:1', label: '1:1', shape: 'square' },
+  { key: '16:9', label: '16:9', shape: 'wide' },
+  { key: '9:16', label: '9:16', shape: 'tall' },
+  { key: '4:3', label: '4:3', shape: 'classic' },
+]
+
+function getModeLabel(key) {
+  return MODE_UI[key]?.label || key
+}
+
+function getModeIcon(key) {
+  return MODE_UI[key]?.icon || 'spark'
+}
+
+function selectRatioOption(ratio) {
+  const option = panels.ratio.options.find((item) => item.startsWith(ratio)) || ratio
+  selectOption('ratio', option)
+}
+
+function isRatioSelected(ratio) {
+  return typeof selected.ratio === 'string' && selected.ratio.startsWith(ratio)
+}
+
+const promptPlaceholder = computed(() => {
+  if (isGenerating.value) return '正在生成，请稍候...'
+  if (requiresItemImage.value) return '描述您想替换的内容... 尝试输入“一件未来感夹克”'
+  if (requiresSourceImage.value) return '描述您想创作的内容... 可粘贴参考图'
+  return '描述您想创作的内容... 尝试输入“一座超现实的赛博朋克城市...”'
+})
 
 const RATIO_DIMENSIONS = {
   '1:1': { width: 1024, height: 1024 },
@@ -325,6 +426,46 @@ const descriptiveFields = ['style', 'quality', 'angle', 'color', 'lighting']
 
 function togglePanel(name) {
   activePanel.value = activePanel.value === name ? null : name
+}
+
+function toggleTemplateLibrary() {
+  activePanel.value = activePanel.value === 'templates' ? null : 'templates'
+}
+
+function selectView(view) {
+  activeView.value = view
+  activePanel.value = null
+}
+
+function openSettingsPanel() {
+  const draft = createComfyUISettingsDraft({
+    imageBaseURL: activeComfyImageBaseURL.value,
+    videoBaseURL: activeComfyVideoBaseURL.value,
+  }, {
+    imageBaseURL: comfyuiConfig.settingsBaseURL,
+    videoBaseURL: comfyuiConfig.settingsVideoBaseURL,
+  })
+  settingsDraft.imageBaseURL = draft.imageBaseURL
+  settingsDraft.videoBaseURL = draft.videoBaseURL
+  settingsStatus.value = ''
+  activePanel.value = activePanel.value === 'settings' ? null : 'settings'
+}
+
+function applyComfySettings(nextSettings) {
+  comfySettings.imageBaseURL = nextSettings.imageBaseURL
+  comfySettings.videoBaseURL = nextSettings.videoBaseURL
+  settingsDraft.imageBaseURL = nextSettings.imageBaseURL
+  settingsDraft.videoBaseURL = nextSettings.videoBaseURL
+}
+
+function saveSettingsPanel() {
+  applyComfySettings(saveComfyUISettings(settingsDraft))
+  settingsStatus.value = '已保存'
+}
+
+function restoreDefaultSettings() {
+  applyComfySettings(resetComfyUISettings())
+  settingsStatus.value = '已恢复默认'
 }
 
 function selectOption(field, value) {
@@ -590,25 +731,71 @@ onBeforeUnmount(() => {
   }
 })
 
-onMounted(async () => {
+onMounted(() => {
   hydrateLocalImagesFromMessages()
   hydrateTemplateImages()
-  await initSpeechRecognition()
+  recoverGeneratingMessages()
+  initSpeechRecognition()
 })
 
 function addToTemplate(imageURL) {
   if (!imageURL) return
   const id = makeUid('tpl')
   templates.value.unshift({ id, imageURL })
-  // 异步缓存模板图片到 IndexedDB
-  cacheImageURLToId(imageURL, `template:${id}`).then((cached) => {
-    if (cached) {
-      const idx = templates.value.findIndex((t) => t.id === id)
-      if (idx !== -1) {
-        templates.value[idx] = { ...templates.value[idx], imageId: `template:${id}` }
+  const imageId = `template:${id}`
+  saveAssetURLToLocal(imageURL, {
+    id: imageId,
+    kind: 'templates',
+    mediaType: 'image',
+  }).then((saved) => {
+    const idx = templates.value.findIndex((t) => t.id === id)
+    if (idx !== -1 && saved?.fileURL) {
+      templates.value[idx] = {
+        ...templates.value[idx],
+        localImageURL: saved.fileURL,
+        localAssetURL: saved.fileURL,
+        localAssetPath: saved.relativePath || '',
       }
     }
+    return saved
+  }).then((saved) => {
+    if (saved?.fileURL) return
+    return cacheImageURLToId(imageURL, imageId).then((cached) => {
+      if (!cached) return
+      const idx = templates.value.findIndex((t) => t.id === id)
+      if (idx !== -1) {
+        templates.value[idx] = { ...templates.value[idx], imageId }
+      }
+    })
+  }).catch(() => {
+    // Local asset persistence is best-effort; the original URL remains mapped.
   })
+}
+
+async function saveAssetURLToLocal(imageURL, options = {}) {
+  const saveFromURL = window.electronAPI?.assets?.saveFromURL
+  if (!imageURL || typeof saveFromURL !== 'function') return null
+
+  try {
+    return await saveFromURL(resolveAssetSourceURL(imageURL), options)
+  } catch (e) {
+    console.warn('[ImageGen] 本地素材保存失败:', e.message, imageURL)
+    return null
+  }
+}
+
+function resolveAssetSourceURL(imageURL) {
+  if (/^(https?:|file:|data:)/i.test(imageURL)) return imageURL
+  return new URL(imageURL, window.location.href).href
+}
+
+function buildLocalAssetPatch(saved) {
+  if (!saved?.fileURL) return {}
+  return {
+    localImageURL: saved.fileURL,
+    localAssetURL: saved.fileURL,
+    localAssetPath: saved.relativePath || '',
+  }
 }
 
 function removeTemplate(templateId) {
@@ -625,7 +812,7 @@ const previewCurrentMsg = computed(() => previewGallery.value[previewIndex.value
 
 const previewImage = computed(() => {
   const msg = previewCurrentMsg.value
-  return msg ? (msg.localImageURL || msg.imageURL) : ''
+  return msg ? getMessageMediaURL(msg) : ''
 })
 
 const previewIsVideo = computed(() => isMessageVideo(previewCurrentMsg.value))
@@ -638,13 +825,21 @@ const previewCounterText = computed(() => {
 
 function openPreview(assistantMsg) {
   if (!assistantMsg || assistantMsg.role !== 'assistant') return
-  const url = assistantMsg.localImageURL || assistantMsg.imageURL
+  const url = getMessageMediaURL(assistantMsg)
   if (!url) return
   const list = previewGallery.value
   const idx = list.findIndex((m) => m.id === assistantMsg.id)
   previewIndex.value = idx >= 0 ? idx : 0
   previewOpen.value = true
   nextTick(() => previewMaskRef.value?.focus())
+}
+
+function getMessageMediaURL(msg) {
+  return msg?.localImageURL || msg?.localAssetURL || msg?.imageURL || ''
+}
+
+function getTemplateMediaURL(tpl) {
+  return tpl?.localImageURL || tpl?.localAssetURL || tpl?.imageURL || ''
 }
 
 function closePreview() {
@@ -863,12 +1058,107 @@ async function cacheFileToId(file, imageId) {
   }
 }
 
+async function completeAssistantMessage(assistantId, media, {
+  isVideoMode = false,
+  promptId,
+  promptBaseURL,
+} = {}) {
+  if (!assistantId || !media?.imageURL) return false
+
+  const outputImageId = `output:${assistantId}`
+  const mediaType = media.mediaType || (isVideoMode || isVideoURL(media.imageURL) ? 'video' : 'image')
+  const currentMessage = messages.value.find((msg) => msg.id === assistantId)
+  const nextPromptId = promptId || currentMessage?.promptId || ''
+  const nextPromptBaseURL = promptBaseURL || currentMessage?.promptBaseURL || ''
+  updateAssistantMessage(assistantId, {
+    status: 'done',
+    imageURL: media.imageURL,
+    imageId: outputImageId,
+    localImageURL: '',
+    mediaType,
+    promptId: nextPromptId,
+    promptBaseURL: nextPromptBaseURL,
+    error: '',
+  })
+
+  const saved = await saveAssetURLToLocal(media.imageURL, {
+    id: outputImageId,
+    kind: 'generated',
+    mediaType,
+  })
+  const localAssetPatch = buildLocalAssetPatch(saved)
+  if (localAssetPatch.localImageURL) {
+    updateAssistantMessage(assistantId, localAssetPatch)
+    return true
+  }
+
+  const cached = await cacheImageURLToId(media.imageURL, outputImageId)
+  if (cached) {
+    const localURL = await ensureLocalObjectURL(outputImageId)
+    if (localURL) updateAssistantMessage(assistantId, { localImageURL: localURL })
+  }
+
+  return true
+}
+
+async function recoverGeneratingMessages() {
+  const pending = messages.value.filter((msg) => msg?.role === 'assistant' && msg.status === 'generating')
+
+  for (const msg of pending) {
+    const baseURL = msg.promptBaseURL || (msg.mediaType === 'video' ? activeComfyVideoBaseURL.value : activeComfyImageBaseURL.value)
+    let promptId = msg.promptId || ''
+    let media = null
+
+    try {
+      if (promptId) {
+        media = await getPromptResult(promptId, { baseURL })
+      } else {
+        const idx = messages.value.findIndex((item) => item.id === msg.id)
+        const userPrompt = idx > 0 && messages.value[idx - 1]?.role === 'user'
+          ? messages.value[idx - 1].text
+          : ''
+        const recovered = await findPromptResultByText(userPrompt, { baseURL })
+        promptId = recovered?.promptId || ''
+        media = recovered?.media || null
+      }
+    } catch (e) {
+      console.warn('[ImageGen] 恢复生成结果失败:', e.message)
+    }
+
+    if (media?.imageURL) {
+      await completeAssistantMessage(msg.id, media, {
+        isVideoMode: msg.mediaType === 'video',
+        promptId,
+        promptBaseURL: baseURL,
+      })
+    } else if (!msg.promptId) {
+      updateAssistantMessage(msg.id, {
+        status: 'error',
+        error: '生成状态已中断，请重新提交',
+      })
+    }
+  }
+}
+
 async function hydrateLocalImagesFromMessages() {
   const list = messages.value || []
   await Promise.all(list.map(async (msg) => {
     if (msg?.role === 'assistant' && msg.imageId) {
-      let localURL = await ensureLocalObjectURL(msg.imageId)
-      // IndexedDB 中没有缓存，尝试从 ComfyUI 服务端重新拉取
+      let localURL = msg.localAssetURL || ''
+      if (!localURL && msg.imageURL) {
+        const mediaType = msg.mediaType || (isVideoURL(msg.imageURL) ? 'video' : 'image')
+        const saved = await saveAssetURLToLocal(msg.imageURL, {
+          id: msg.imageId,
+          kind: 'generated',
+          mediaType,
+        })
+        if (saved?.fileURL) {
+          const patch = buildLocalAssetPatch(saved)
+          updateAssistantMessage(msg.id, patch)
+          localURL = patch.localImageURL
+        }
+      }
+      if (!localURL) localURL = await ensureLocalObjectURL(msg.imageId)
       if (!localURL && msg.imageURL) {
         const cached = await cacheImageURLToId(msg.imageURL, msg.imageId)
         if (cached) localURL = await ensureLocalObjectURL(msg.imageId)
@@ -906,15 +1196,34 @@ async function hydrateTemplateImages() {
   const list = templates.value || []
   await Promise.all(list.map(async (tpl) => {
     if (!tpl.imageURL) return
-    // 优先用 IndexedDB 缓存
     const imageId = tpl.imageId || `template:${tpl.id}`
-    let localURL = await ensureLocalObjectURL(imageId)
+    let localURL = tpl.localAssetURL || ''
+    if (!localURL) {
+      const saved = await saveAssetURLToLocal(tpl.imageURL, {
+        id: imageId,
+        kind: 'templates',
+        mediaType: 'image',
+      })
+      if (saved?.fileURL) {
+        localURL = saved.fileURL
+        const idx = templates.value.findIndex((t) => t.id === tpl.id)
+        if (idx !== -1) {
+          templates.value[idx] = {
+            ...templates.value[idx],
+            ...buildLocalAssetPatch(saved),
+          }
+        }
+      }
+    }
+    if (!localURL) {
+      // 优先用 IndexedDB 缓存
+      localURL = await ensureLocalObjectURL(imageId)
+    }
     if (!localURL) {
       // IndexedDB 中没有，尝试从 ComfyUI 服务端拉取并缓存
       const cached = await cacheImageURLToId(tpl.imageURL, imageId)
       if (cached) {
         localURL = await ensureLocalObjectURL(imageId)
-        // 回写 imageId 以便下次快速查找
         const idx = templates.value.findIndex((t) => t.id === tpl.id)
         if (idx !== -1 && !templates.value[idx].imageId) {
           templates.value[idx] = { ...templates.value[idx], imageId }
@@ -937,7 +1246,7 @@ function isVideoURL(url) {
 function isMessageVideo(msg) {
   if (!msg) return false
   if (msg.mediaType === 'video') return true
-  return isVideoURL(msg.localImageURL || msg.imageURL)
+  return isVideoURL(msg.localImageURL) || isVideoURL(msg.localAssetURL) || isVideoURL(msg.imageURL)
 }
 
 function randomizeWorkflowSeeds(workflow) {
@@ -1149,7 +1458,7 @@ function applyRatioToWorkflow(workflow) {
   }
 }
 
-function getUploadedImageURL(uploadResult, baseURL = comfyuiConfig.baseURL) {
+function getUploadedImageURL(uploadResult, baseURL = activeComfyImageBaseURL.value) {
   return uploadResult?.name
     ? `${baseURL}/view?filename=${encodeURIComponent(uploadResult.name)}&subfolder=${encodeURIComponent(uploadResult.subfolder || '')}&type=${encodeURIComponent(uploadResult.type || 'input')}`
     : ''
@@ -1161,7 +1470,7 @@ function getUploadedImageId(uploadResult, prefix = 'input') {
     : makeUid(prefix)
 }
 
-async function uploadWorkflowImage(file, cachePrefix = 'input', baseURL = comfyuiConfig.baseURL) {
+async function uploadWorkflowImage(file, cachePrefix = 'input', baseURL = activeComfyImageBaseURL.value) {
   const uploadResult = await uploadImage(file, { baseURL })
   const imageURL = getUploadedImageURL(uploadResult, baseURL)
   const imageId = getUploadedImageId(uploadResult, cachePrefix)
@@ -1181,9 +1490,9 @@ async function generate() {
   isGenerating.value = true
 
   const isVideoMode = selected.mode === 'text_to_video' || selected.mode === 'image_to_video'
-  const requestBaseURL = isVideoMode ? comfyuiConfig.videoBaseURL : comfyuiConfig.baseURL
+  const requestBaseURL = isVideoMode ? activeComfyVideoBaseURL.value : activeComfyImageBaseURL.value
 
-  if (requiresSourceImage.value && !sourceImageFile.value) {
+  if (isSourceImageRequiredForSubmit(selected.mode) && !sourceImageFile.value) {
     isGenerating.value = false
     alert(requiresItemImage.value ? '替换物品需要先上传原图' : '图生图/图生视频需要先上传一张图片')
     return
@@ -1196,7 +1505,7 @@ async function generate() {
   }
 
   activePanel.value = null
-  const workflowKey = modeButtons.find((item) => item.key === selected.mode)?.workflowKey || 'textToImage'
+  const workflowKey = getWorkflowKeyForSubmit(selected.mode, Boolean(sourceImageFile.value))
   const baseWorkflow = workflows[workflowKey] || workflows.default
   const workflow = JSON.parse(JSON.stringify(baseWorkflow))
   let userSourceImageURL = ''
@@ -1211,7 +1520,7 @@ async function generate() {
   }
   randomizeWorkflowSeeds(workflow)
 
-  if (requiresSourceImage.value) {
+  if (requiresSourceImage.value && sourceImageFile.value) {
     try {
       const sourceUpload = await uploadWorkflowImage(sourceImageFile.value, 'input', requestBaseURL)
       userSourceImageURL = sourceUpload.imageURL
@@ -1255,23 +1564,19 @@ async function generate() {
   prompt.value = ''
   if (requiresSourceImage.value) clearAllSourceImages()
 
-  await submit(workflow, isVideoMode
-    ? { baseURL: requestBaseURL, pollMaxTries: 600 }
-    : { baseURL: requestBaseURL, pollMaxTries: 100 })
+  const submitOptions = {
+    baseURL: requestBaseURL,
+    pollMaxTries: isVideoMode ? 600 : 100,
+    fallbackText: userPrompt,
+    onPromptId: (promptId) => updateAssistantMessage(assistantId, { promptId, promptBaseURL: requestBaseURL }),
+  }
+
+  await submit(workflow, submitOptions)
 
   if (result.value?.imageURL) {
-    const outputImageId = `output:${assistantId}`
-    const cached = await cacheImageURLToId(result.value.imageURL, outputImageId)
-    const localURL = cached ? await ensureLocalObjectURL(outputImageId) : ''
-    const mediaType = result.value.mediaType
-      || (isVideoMode || isVideoURL(result.value.imageURL) ? 'video' : 'image')
-    updateAssistantMessage(assistantId, {
-      status: 'done',
-      imageURL: result.value.imageURL,
-      imageId: outputImageId,
-      localImageURL: localURL || '',
-      mediaType,
-      error: '',
+    await completeAssistantMessage(assistantId, result.value, {
+      isVideoMode,
+      promptBaseURL: requestBaseURL,
     })
     return
   }
@@ -1283,202 +1588,238 @@ async function generate() {
 }
 </script>
 
+
 <template>
   <div class="page" @click.self="activePanel = null">
-    <div class="slogan">
-      <span>灵感触手可及</span>
-      <img src="../assets/logo.svg" alt="" class="slogan-icon" />
-      <span>创作不再受限</span>
-    </div>
-
-    <div class="main-content">
-      <div ref="conversationRef" class="chat-area">
-        <div v-if="!messages.length" class="empty-chat">
-          输入提示词后，提示词和生成结果会以对话形式永久保存在本地。
-        </div>
-
-        <div v-for="msg in messages" :key="msg.id" class="chat-row" :class="`role-${msg.role}`">
-          <div class="chat-bubble">
-            <div class="chat-meta">
-              <div class="chat-role">{{ msg.role === 'user' ? '你' : 'AI' }}</div>
-              <button type="button" class="message-delete-btn" title="删除该记录" @click="removeMessage(msg.id)">删除</button>
-            </div>
-
-            <template v-if="msg.role === 'user'">
-              <img
-                v-if="msg.localSourceImageURL || msg.sourceImageURL"
-                :src="msg.localSourceImageURL || msg.sourceImageURL"
-                class="user-source-image"
-                alt="参考图"
-              />
-              <img
-                v-if="msg.localSourceImage2URL || msg.sourceImage2URL"
-                :src="msg.localSourceImage2URL || msg.sourceImage2URL"
-                class="user-source-image"
-                alt="替换物品图"
-              />
-              <div class="chat-text">{{ msg.text }}</div>
-            </template>
-
-            <template v-else>
-              <div v-if="msg.status === 'generating'" class="generating-tip">正在生成，请稍候...</div>
-              <video
-                v-else-if="isMessageVideo(msg) && (msg.localImageURL || msg.imageURL)"
-                :src="msg.localImageURL || msg.imageURL"
-                class="result-video result-img-clickable"
-                controls
-                playsinline
-                loop
-                title="点击查看大图，左右滑动切换"
-                @click="openPreview(msg)"
-              />
-              <img
-                v-else-if="msg.localImageURL || msg.imageURL"
-                :src="msg.localImageURL || msg.imageURL"
-                class="result-img result-img-clickable"
-                alt="生成结果"
-                title="点击查看大图，左右滑动切换"
-                @click="openPreview(msg)"
-              />
-              <div v-else class="error-tip">{{ msg.error }}</div>
-
-              <div v-if="msg.imageURL" class="result-actions">
-                <button
-                  v-if="!isMessageVideo(msg)"
-                  class="action-btn"
-                  @click="addToTemplate(msg.localImageURL || msg.imageURL)"
-                >加入模板</button>
-                <button class="action-btn" @click="downloadResult(msg.localImageURL || msg.imageURL)">下载</button>
-              </div>
-            </template>
-          </div>
-        </div>
+    <aside class="icon-rail" aria-label="主导航">
+      <div class="rail-top">
+        <button
+          class="rail-btn"
+          :class="{ 'rail-btn-active': activeView === 'aigc' && activePanel !== 'settings' }"
+          type="button"
+          title="AIGC"
+          @click.stop="selectView('aigc')"
+        >
+          <FigmaIcon name="bot" />
+        </button>
+        <button
+          class="rail-btn"
+          :class="{ 'rail-btn-active': activeView === 'assets' && activePanel !== 'settings' }"
+          type="button"
+          title="素材库"
+          data-testid="asset-library-button"
+          @click.stop="selectView('assets')"
+        >
+          <FigmaIcon name="library" />
+        </button>
+      </div>
+      <div class="rail-bottom">
+        <button
+          class="rail-btn"
+          :class="{ 'rail-btn-active': activePanel === 'settings' }"
+          type="button"
+          title="设置"
+          data-testid="settings-button"
+          @click.stop="openSettingsPanel"
+        >
+          <FigmaIcon name="settings" />
+        </button>
       </div>
 
-      <div class="input-area">
-        <div class="template-bar">
-          <span class="template-bar-label">模板库</span>
-          <button class="template-more">></button>
-          <div class="template-list">
-            <div
-              v-for="t in templates"
-              :key="t.id"
-              class="template-card"
-            >
-              <img v-if="t.localImageURL || t.imageURL" :src="t.localImageURL || t.imageURL" class="template-card-img" alt="" />
-              <div v-else class="template-card-color" :style="{ background: t.color }"></div>
-              <button class="template-delete" title="删除模板" @click.stop="removeTemplate(t.id)">×</button>
-            </div>
+      <section
+        v-if="activePanel === 'settings'"
+        class="settings-popover"
+        data-testid="settings-popover"
+        aria-label="ComfyUI 设置"
+        @click.stop
+      >
+        <div class="settings-header">
+          <div>
+            <h2>设置</h2>
+            <p>ComfyUI 服务 IP/端口</p>
           </div>
+          <button class="settings-close" type="button" title="关闭" @click="activePanel = null">
+            <FigmaIcon name="close" />
+          </button>
         </div>
 
-        <div class="input-box" :class="{ generating: isGenerating }" @paste.capture="handlePasteImageInInputArea">
-          <div v-if="requiresSourceImage" class="source-image-uploader">
-            <div class="source-image-group">
-              <input
-                ref="sourceImageInputRef"
-                type="file"
-                accept="image/*"
-                class="source-image-input"
-                :disabled="isGenerating"
-                @change="handleSourceImageChange"
-              />
-              <button type="button" class="source-image-btn" :disabled="isGenerating" @click="triggerSourceImagePicker">
-                {{ sourceImageFile ? (requiresItemImage ? '重新上传原图' : '重新上传参考图') : (requiresItemImage ? '上传原图' : '上传参考图') }}
-              </button>
-              <div v-if="sourceImagePreview" class="source-image-preview-wrap">
-                <img :src="sourceImagePreview" class="source-image-preview" alt="source preview" />
-                <button type="button" class="source-image-clear" :disabled="isGenerating" @click="clearSourceImage">移除</button>
-              </div>
-            </div>
+        <label class="settings-field">
+          <span>生图 IP/端口</span>
+          <input
+            v-model.trim="settingsDraft.imageBaseURL"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="http://192.168.0.131:8188"
+          />
+        </label>
 
-            <div v-if="requiresItemImage" class="source-image-group">
-              <input
-                ref="itemImageInputRef"
-                type="file"
-                accept="image/*"
-                class="source-image-input"
-                :disabled="isGenerating"
-                @change="handleItemImageChange"
-              />
-              <button type="button" class="source-image-btn" :disabled="isGenerating" @click="triggerItemImagePicker">
-                {{ itemImageFile ? '重新上传物品图' : '上传物品图' }}
-              </button>
-              <div v-if="itemImagePreview" class="source-image-preview-wrap">
-                <img :src="itemImagePreview" class="source-image-preview" alt="item preview" />
-                <button type="button" class="source-image-clear" :disabled="isGenerating" @click="clearItemImage">移除</button>
-              </div>
-            </div>
-          </div>
+        <label class="settings-field">
+          <span>生视频 IP/端口</span>
+          <input
+            v-model.trim="settingsDraft.videoBaseURL"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="http://192.168.0.131:8188"
+          />
+        </label>
 
-          <div class="textarea-wrapper">
-            <textarea
-              v-model="prompt"
-              class="prompt-input"
-              :placeholder="isGenerating ? '正在生成，请稍候...' : (requiresItemImage ? '输入替换要求（可 Ctrl+V 依次粘贴两张图）' : (requiresSourceImage ? '输入提示词（可 Ctrl+V 粘贴参考图）' : '输入提示词'))"
-              :disabled="isGenerating"
-              @keydown.ctrl.enter="generate"
+        <div class="settings-actions">
+          <button class="settings-secondary" type="button" @click="restoreDefaultSettings">恢复默认</button>
+          <button class="settings-primary" type="button" @click="saveSettingsPanel">保存</button>
+        </div>
+        <p v-if="settingsStatus" class="settings-status">{{ settingsStatus }}</p>
+      </section>
+    </aside>
+
+    <main v-if="activeView === 'assets'" class="asset-page" aria-label="素材库" data-testid="asset-library">
+      <header class="asset-page-header">
+        <div>
+          <h1>素材库</h1>
+          <p>{{ history.length ? `${history.length} 个生成素材` : '生成历史会出现在这里' }}</p>
+        </div>
+        <button
+          v-if="history.length"
+          type="button"
+          class="asset-clear-btn"
+          title="清空历史"
+          @click="clearHistory"
+        >
+          清空
+        </button>
+      </header>
+
+      <section class="asset-page-section" aria-label="生成历史">
+        <div class="asset-section-title">生成历史</div>
+        <div v-if="history.length" class="asset-page-grid">
+          <div
+            v-for="h in history"
+            :key="h.id"
+            class="asset-card"
+            role="button"
+            tabindex="0"
+            title="预览素材"
+            @click="openPreview(h)"
+            @keydown.enter.prevent="openPreview(h)"
+            @keydown.space.prevent="openPreview(h)"
+          >
+            <video
+              v-if="isMessageVideo(h)"
+              :src="getMessageMediaURL(h)"
+              class="asset-card-media"
+              muted
+              playsinline
+              loop
             />
-            <button
-              v-if="isSpeechSupported"
-              type="button"
-              class="voice-btn"
-              :class="{
-                listening: isListening,
-                loading: isSpeechLoading,
-                disabled: isGenerating || isSpeechLoading
-              }"
-              :title="isSpeechLoading ? '正在加载语音识别...' : (isListening ? '点击停止录音' : '点击开始语音输入')"
-              :disabled="isGenerating || isSpeechLoading"
-              @click="toggleSpeechRecognition"
-            >
-              <svg v-if="isSpeechLoading" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spin">
-                <circle cx="12" cy="12" r="10" stroke-dasharray="60" stroke-dashoffset="20"/>
-              </svg>
-              <svg v-else-if="isListening" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-                <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
-                  <animate attributeName="r" values="8;12;8" dur="1.5s" repeatCount="indefinite"/>
-                  <animate attributeName="opacity" values="0.5;0;0.5" dur="1.5s" repeatCount="indefinite"/>
-                </circle>
-              </svg>
-              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                <line x1="12" y1="19" x2="12" y2="23"/>
-                <line x1="8" y1="23" x2="16" y2="23"/>
-              </svg>
+            <img v-else :src="getMessageMediaURL(h)" class="asset-card-media" alt="" />
+            <span v-if="isMessageVideo(h)" class="asset-type-badge">视频</span>
+            <span class="asset-card-shade"></span>
+            <button type="button" class="asset-delete-btn" title="删除" @click.stop="removeHistoryItem(h.id)">
+              <FigmaIcon name="close" />
             </button>
           </div>
+        </div>
+        <div v-else class="asset-empty">
+          <FigmaIcon name="library" />
+          <span>暂无素材</span>
+        </div>
+      </section>
+    </main>
 
-          <div class="toolbar">
-            <div class="toolbar-item-wrap">
-              <button
-                class="toolbar-btn"
-                :class="{ active: activePanel === 'ratio' }"
-                title="比例"
-                @click.stop="togglePanel('ratio')"
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
-              </button>
-              <ToolbarPanel
-                v-if="activePanel === 'ratio'"
-                :panel="panels.ratio"
-                :selected="selected.ratio"
-                @select="(v) => selectOption('ratio', v)"
-                @close="activePanel = null"
-              />
+    <main v-else class="app-shell">
+      <section class="control-panel" aria-label="创作控制台">
+        <div class="controls-scroll">
+          <header class="brand-block">
+            <img src="../assets/logo.svg" alt="" class="brand-mark" />
+            <div>
+              <h1>AIGC</h1>
+              <p>MDT 创作工作台</p>
             </div>
+          </header>
 
-            <div class="toolbar-item-wrap">
+          <div class="panel-section">
+            <div class="section-label">创作模式</div>
+            <div class="mode-switch figma-mode-switch">
               <button
-                class="toolbar-btn"
+                v-for="item in modeButtons"
+                :key="item.key"
+                type="button"
+                class="mode-card"
+                :class="{ active: selected.mode === item.key }"
+                @click.stop="selectMode(item.key)"
+              >
+                <span class="mode-icon">
+                  <FigmaIcon :name="getModeIcon(item.key)" />
+                </span>
+                <span>{{ getModeLabel(item.key) }}</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="panel-divider"></div>
+
+          <div class="panel-section" data-testid="preset-template-section">
+            <div class="section-row">
+              <div class="section-label">预设模板</div>
+              <button class="small-icon-btn" type="button" title="添加模板"><FigmaIcon name="templatePlus" /></button>
+            </div>
+            <button
+              class="template-browse"
+              type="button"
+              data-testid="browse-template-library"
+              @click.stop="toggleTemplateLibrary"
+            >
+              <FigmaIcon name="templateBrowse" />
+              <span>浏览模板库...</span>
+              <FigmaIcon name="chevronRight" />
+            </button>
+            <div
+              v-if="activePanel === 'templates'"
+              class="template-library-panel"
+              data-testid="template-library-panel"
+              @click.stop
+            >
+              <div class="template-library-header">
+                <span>模板库</span>
+                <button type="button" title="关闭" @click="activePanel = null">
+                  <FigmaIcon name="close" />
+                </button>
+              </div>
+              <div class="template-library-grid">
+                <button
+                  v-for="t in templates"
+                  :key="t.id"
+                  type="button"
+                  class="template-library-item"
+                  title="模板预览"
+                >
+                  <img v-if="getTemplateMediaURL(t)" :src="getTemplateMediaURL(t)" alt="" />
+                  <span v-else :style="{ background: t.color }"></span>
+                </button>
+              </div>
+            </div>
+            <div v-if="templates.length" class="template-chip-row">
+              <div v-for="t in templates.slice(0, 2)" :key="t.id" class="template-chip">
+                <img v-if="getTemplateMediaURL(t)" :src="getTemplateMediaURL(t)" alt="" />
+                <span v-else :style="{ background: t.color }"></span>
+                <button type="button" title="删除模板" @click.stop="removeTemplate(t.id)"><FigmaIcon name="close" /></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-label">风格核心</div>
+            <div class="toolbar-item-wrap style-select-wrap">
+              <button
+                class="style-select"
+                type="button"
                 :class="{ active: activePanel === 'style' }"
-                title="风格"
                 @click.stop="togglePanel('style')"
               >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="3" r="1"/><circle cx="21" cy="12" r="1"/><circle cx="12" cy="21" r="1"/><circle cx="3" cy="12" r="1"/></svg>
+                <FigmaIcon name="palette" />
+                <span>{{ selected.style || '选择风格' }}</span>
+                <FigmaIcon name="chevronDown" />
               </button>
               <ToolbarPanel
                 v-if="activePanel === 'style'"
@@ -1488,61 +1829,23 @@ async function generate() {
                 @close="activePanel = null"
               />
             </div>
+          </div>
 
-            <div class="toolbar-item-wrap">
+          <div class="panel-section">
+            <div class="section-label">宽高比</div>
+            <div class="ratio-grid">
               <button
-                class="toolbar-btn"
-                :class="{ active: activePanel === 'quality' }"
-                title="质感"
-                @click.stop="togglePanel('quality')"
+                v-for="item in ratioOptions"
+                :key="item.key"
+                type="button"
+                class="ratio-card"
+                :class="[{ active: isRatioSelected(item.key) }, 'ratio-' + item.shape]"
+                @click="selectRatioOption(item.key)"
               >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+                <span class="ratio-shape"></span>
+                <span>{{ item.label }}</span>
               </button>
-              <ToolbarPanel
-                v-if="activePanel === 'quality'"
-                :panel="panels.quality"
-                :selected="selected.quality"
-                @select="(v) => selectOption('quality', v)"
-                @close="activePanel = null"
-              />
             </div>
-
-            <div class="toolbar-item-wrap">
-              <button
-                class="toolbar-btn"
-                :class="{ active: activePanel === 'angle' }"
-                title="视角"
-                @click.stop="togglePanel('angle')"
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-              </button>
-              <ToolbarPanel
-                v-if="activePanel === 'angle'"
-                :panel="panels.angle"
-                :selected="selected.angle"
-                @select="(v) => selectOption('angle', v)"
-                @close="activePanel = null"
-              />
-            </div>
-
-            <div class="toolbar-item-wrap">
-              <button
-                class="toolbar-btn"
-                :class="{ active: activePanel === 'lighting' }"
-                title="灯光"
-                @click.stop="togglePanel('lighting')"
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-              </button>
-              <ToolbarPanel
-                v-if="activePanel === 'lighting'"
-                :panel="panels.lighting"
-                :selected="selected.lighting"
-                @select="(v) => selectOption('lighting', v)"
-                @close="activePanel = null"
-              />
-            </div>
-
             <div class="resolution-inputs" @click.stop>
               <input
                 v-model.number="selected.width"
@@ -1568,58 +1871,174 @@ async function generate() {
                 @blur="syncResolution('height')"
               />
             </div>
-
-            <div class="mode-switch">
-              <button
-                v-for="item in modeButtons"
-                :key="item.key"
-                class="toolbar-text-btn mode-btn"
-                :class="{ active: selected.mode === item.key }"
-                @click.stop="selectMode(item.key)"
-              >{{ item.label }}</button>
-            </div>
-
-            <button v-if="isGenerating" class="generate-btn generating" @click="cancel" title="取消生成">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-            </button>
-            <button v-else class="generate-btn" @click="generate">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-            </button>
           </div>
         </div>
 
-        <div v-if="history.length" class="history-area">
-          <div class="history-header">
-            <div class="history-label">生成历史</div>
-            <button type="button" class="history-clear-btn" @click="clearHistory">清空历史</button>
-          </div>
-          <div class="history-list">
-            <div
-              v-for="h in history"
-              :key="h.id"
-              class="history-card"
-              @click="openPreview(h)"
-            >
-              <video
-                v-if="isMessageVideo(h)"
-                :src="h.localImageURL || h.imageURL"
-                class="history-card-img history-card-video"
-                muted
-                playsinline
-                loop
+        <div class="composer-wrap input-area" data-testid="prompt-composer">
+          <div v-if="requiresSourceImage" class="source-image-uploader">
+            <div class="source-image-group">
+              <input
+                ref="sourceImageInputRef"
+                type="file"
+                accept="image/*"
+                class="source-image-input"
+                :disabled="isGenerating"
+                @change="handleSourceImageChange"
               />
-              <img v-else :src="h.localImageURL || h.imageURL" class="history-card-img" alt="" />
+              <button type="button" class="source-image-btn" :disabled="isGenerating" @click="triggerSourceImagePicker">
+                {{ sourceImageFile ? (requiresItemImage ? '已选原图' : '已选参考图') : (requiresItemImage ? '上传原图' : '上传参考图') }}
+              </button>
+              <div v-if="sourceImagePreview" class="source-image-preview-wrap">
+                <img :src="sourceImagePreview" class="source-image-preview" alt="原图预览" />
+                <button type="button" class="source-image-clear" :disabled="isGenerating" @click="clearSourceImage">
+                  <FigmaIcon name="close" />
+                </button>
+              </div>
+            </div>
+            <div v-if="requiresItemImage" class="source-image-group">
+              <input
+                ref="itemImageInputRef"
+                type="file"
+                accept="image/*"
+                class="source-image-input"
+                :disabled="isGenerating"
+                @change="handleItemImageChange"
+              />
+              <button type="button" class="source-image-btn" :disabled="isGenerating" @click="triggerItemImagePicker">
+                {{ itemImageFile ? '已选物品图' : '上传物品图' }}
+              </button>
+              <div v-if="itemImagePreview" class="source-image-preview-wrap">
+                <img :src="itemImagePreview" class="source-image-preview" alt="物品图预览" />
+                <button type="button" class="source-image-clear" :disabled="isGenerating" @click="clearItemImage">
+                  <FigmaIcon name="close" />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="textarea-wrapper" @paste.capture="handlePasteImageInInputArea">
+            <textarea
+              v-model="prompt"
+              class="prompt-input"
+              :placeholder="promptPlaceholder"
+              :disabled="isGenerating"
+              @keydown.ctrl.enter="generate"
+            />
+            <div class="composer-actions">
               <button
+                v-if="isSpeechSupported"
                 type="button"
-                class="history-item-delete-btn"
-                title="删除该历史"
-                @click.stop="removeHistoryItem(h.id)"
-              >×</button>
+                class="composer-tool voice-btn"
+                :class="{ listening: isListening, loading: isSpeechLoading, disabled: isGenerating || isSpeechLoading }"
+                :title="speechButtonTitle"
+                :disabled="isGenerating || isSpeechLoading"
+                @click="toggleSpeechRecognition"
+              >
+                <FigmaIcon name="mic" />
+              </button>
+              <button v-if="isGenerating" type="button" class="send-btn generating" title="取消生成" @click="cancel">
+                <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" /></svg>
+              </button>
+              <button v-else type="button" class="send-btn" title="开始生成" @click="generate">
+                <FigmaIcon name="send" />
+              </button>
+            </div>
+            <p v-if="speechError" class="speech-error" data-testid="speech-error">{{ speechError }}</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="创作结果">
+        <div ref="conversationRef" class="chat-area">
+          <div class="assistant-intro">
+            <div class="bot-avatar"><FigmaIcon name="bot" /></div>
+            <div class="intro-card">欢迎来到 MDT AIGC！请描述您的想法，让我们共同创造非凡的作品。</div>
+          </div>
+          <div v-if="!messages.length" class="empty-chat">
+            <p>黄昏时分未来赛博朋克大都市的宏大定场镜头。高耸的粗野主义摩天大楼没人发光的霓虹灯雾渊中。</p>
+          </div>
+          <div v-if="!messages.length" class="chat-row role-assistant">
+            <div class="bot-avatar"><FigmaIcon name="bot" /></div>
+            <div class="chat-bubble figma-preview-card">
+              <div class="result-shell">
+                <img :src="figmaResultPreview" class="result-img" alt="Figma 生成结果预览" />
+              </div>
+              <div class="result-actions">
+                <button class="action-btn" type="button">
+                  <FigmaIcon name="addTemplate" />
+                  加入模板
+                </button>
+                <button class="action-btn" type="button">
+                  <FigmaIcon name="download" />
+                  下载
+                </button>
+              </div>
+            </div>
+          </div>
+          <div v-for="msg in messages" :key="msg.id" class="chat-row" :class="'role-' + msg.role">
+            <div v-if="msg.role === 'assistant'" class="bot-avatar"><FigmaIcon name="bot" /></div>
+            <div class="chat-bubble">
+              <div class="chat-meta">
+                <span>{{ msg.role === 'user' ? '你' : 'AI' }}</span>
+                <button type="button" class="message-delete-btn" title="删除" @click="removeMessage(msg.id)">删除</button>
+              </div>
+              <template v-if="msg.role === 'user'">
+                <div
+                  v-if="msg.localSourceImageURL || msg.sourceImageURL || msg.localSourceImage2URL || msg.sourceImage2URL"
+                  class="user-images"
+                >
+                  <img
+                    v-if="msg.localSourceImageURL || msg.sourceImageURL"
+                    :src="msg.localSourceImageURL || msg.sourceImageURL"
+                    class="user-source-image"
+                    alt="原图"
+                  />
+                  <img
+                    v-if="msg.localSourceImage2URL || msg.sourceImage2URL"
+                    :src="msg.localSourceImage2URL || msg.sourceImage2URL"
+                    class="user-source-image"
+                    alt="物品图"
+                  />
+                </div>
+                <div class="chat-text">{{ msg.text }}</div>
+              </template>
+              <template v-else>
+                <div v-if="msg.status === 'generating'" class="generating-tip">正在生成中...</div>
+                <div v-else-if="isMessageVideo(msg) && getMessageMediaURL(msg)" class="result-shell">
+                  <video
+                    :src="getMessageMediaURL(msg)"
+                    class="result-video result-img-clickable"
+                    controls
+                    playsinline
+                    loop
+                    @click="openPreview(msg)"
+                  />
+                </div>
+                <div v-else-if="getMessageMediaURL(msg)" class="result-shell">
+                  <img
+                    :src="getMessageMediaURL(msg)"
+                    class="result-img result-img-clickable"
+                    alt="生成结果"
+                    @click="openPreview(msg)"
+                  />
+                </div>
+                <div v-else class="error-tip">{{ msg.error }}</div>
+                <div v-if="msg.imageURL" class="result-actions">
+                  <button v-if="!isMessageVideo(msg)" class="action-btn" @click="addToTemplate(getMessageMediaURL(msg))">
+                    <FigmaIcon name="addTemplate" />
+                    加入模板
+                  </button>
+                  <button class="action-btn" @click="downloadResult(getMessageMediaURL(msg))">
+                    <FigmaIcon name="download" />
+                    下载
+                  </button>
+                </div>
+              </template>
             </div>
           </div>
         </div>
-      </div>
-    </div>
+      </section>
+    </main>
 
     <div
       v-if="previewOpen"
@@ -1635,10 +2054,11 @@ async function generate() {
             v-if="previewGallery.length > 1"
             type="button"
             class="preview-nav preview-nav-prev"
-            title="上一张（← 或向右滑）"
             aria-label="上一张"
             @click.stop="previewShowPrev"
-          >‹</button>
+          >
+            ‹
+          </button>
           <div
             class="preview-media"
             @touchstart.passive="onPreviewTouchStart"
@@ -1656,16 +2076,17 @@ async function generate() {
               playsinline
               loop
             />
-            <img v-else-if="previewImage" :src="previewImage" class="preview-image" alt="大图预览" />
+            <img v-else-if="previewImage" :src="previewImage" class="preview-image" alt="预览结果" />
           </div>
           <button
             v-if="previewGallery.length > 1"
             type="button"
             class="preview-nav preview-nav-next"
-            title="下一张（→ 或向左滑）"
             aria-label="下一张"
             @click.stop="previewShowNext"
-          >›</button>
+          >
+            ›
+          </button>
         </div>
         <div v-if="previewCounterText" class="preview-counter">{{ previewCounterText }}</div>
         <div class="preview-actions">
@@ -1679,766 +2100,170 @@ async function generate() {
 </template>
 
 <style scoped>
-.page {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 40px 24px 20px;
-  background: #fff;
-}
-
-.slogan {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  font-size: 36px;
-  font-weight: 500;
-  color: #1a1a1a;
-  margin-bottom: 24px;
-  letter-spacing: -0.5px;
-}
-
-.slogan-icon {
-  width: 72px;
-  height: 72px;
-  object-fit: contain;
-}
-
-.main-content {
-  width: 100%;
-  max-width: 1140px;
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.chat-area {
-  width: min(100%, 820px);
-  margin: 0 auto;
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 12px 6px 18px;
-}
-
-.empty-chat {
-  color: #9b9b9b;
-  font-size: 14px;
-  text-align: center;
-  padding: 26px 16px;
-  border: 1px dashed #d8d8d8;
-  border-radius: 14px;
-}
-
-.chat-row {
-  display: flex;
-}
-
-.chat-row.role-user {
-  justify-content: flex-end;
-}
-
-.chat-row.role-assistant {
-  justify-content: flex-start;
-}
-
-.chat-bubble {
-  max-width: min(100%, 680px);
-  border-radius: 16px;
-  padding: 12px 14px;
-  background: #f5f6f8;
-  border: 1px solid #e9e9e9;
-}
-
-.chat-row.role-user .chat-bubble {
-  background: #ebf4ff;
-  border-color: #d8e9ff;
-}
-
-.chat-role {
-  font-size: 11px;
-  color: #7c7c7c;
-}
-
-.chat-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 6px;
-  gap: 8px;
-}
-
-.message-delete-btn {
-  border: none;
-  background: transparent;
-  color: #8f8f8f;
-  font-size: 12px;
-  cursor: pointer;
-  padding: 2px 4px;
-  border-radius: 6px;
-}
-
-.message-delete-btn:hover {
-  color: #ff5f6d;
-  background: #fff1f3;
-}
-
-.chat-text {
-  font-size: 14px;
-  color: #1a1a1a;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.user-source-image {
-  width: 100%;
-  max-width: 320px;
-  border-radius: 10px;
-  border: 1px solid #dcdcdc;
-  margin-bottom: 8px;
-  display: block;
-}
-
-.result-img,
-.result-video {
-  width: 100%;
-  max-width: 620px;
-  border-radius: 12px;
-  display: block;
-}
-
-.result-video {
-  background: #000;
-}
-
-.generating-tip {
-  color: #808080;
-  font-size: 14px;
-}
-
-.error-tip {
-  color: #d94a4a;
-  font-size: 14px;
-}
-
-.result-actions {
-  margin-top: 10px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.action-btn {
-  border: 1px solid #d8d8d8;
-  border-radius: 8px;
-  background: #fff;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: #4a4a4a;
-  cursor: pointer;
-}
-
-.action-btn:hover {
-  background: #f6f6f6;
-}
-
-.input-area {
-  width: min(100%, 820px);
-  margin: 0 auto;
-  position: sticky;
-  bottom: 0;
-  z-index: 20;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding-top: 12px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 28%);
-}
-
-.template-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: #f0f0f0;
-  border-radius: 14px;
-  padding: 10px 14px;
-  align-self: flex-end;
-  min-width: 320px;
-}
-
-.template-bar-label {
-  font-size: 12px;
-  color: #888;
-  white-space: nowrap;
-}
-
-.template-more {
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: 14px;
-  color: #888;
-  margin-left: auto;
-  padding: 2px 4px;
-}
-
-.template-list {
-  display: flex;
-  gap: 8px;
-}
-
-.template-card {
-  position: relative;
-  width: 56px;
-  height: 56px;
-  border-radius: 10px;
-  flex-shrink: 0;
-  overflow: hidden;
-}
-
-.template-card-img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.template-card-color {
-  width: 100%;
-  height: 100%;
-}
-
-.template-delete {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 16px;
-  height: 16px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.65);
-  color: #fff;
-  font-size: 12px;
-  line-height: 16px;
-  padding: 0;
-  cursor: pointer;
-}
-
-.template-delete:hover {
-  background: rgba(0, 0, 0, 0.85);
-}
-
-.input-box {
-  width: 100%;
-  box-sizing: border-box;
-  background: #fff;
-  border: 2px solid #4b9ef8;
-  border-radius: 20px;
-  padding: 14px 14px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  transition: border-color 0.2s;
-}
-
-.input-box.generating {
-  border-color: #bbb;
-}
-
-.source-image-uploader {
-  border: 1px dashed #d5def0;
-  border-radius: 12px;
-  padding: 10px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  background: #f8fbff;
-}
-
-.source-image-group {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.source-image-input {
-  display: none;
-}
-
-.source-image-btn {
-  height: 32px;
-  padding: 0 12px;
-  border-radius: 8px;
-  border: 1px solid #9cc2ff;
-  background: #fff;
-  color: #2f6fd6;
-  cursor: pointer;
-}
-
-.source-image-btn:disabled {
-  opacity: 0.65;
-  cursor: not-allowed;
-}
-
-.source-image-preview-wrap {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.source-image-preview {
-  width: 60px;
-  height: 60px;
-  border-radius: 10px;
-  object-fit: cover;
-  border: 1px solid #dcdcdc;
-}
-
-.source-image-clear {
-  border: none;
-  background: none;
-  color: #757575;
-  cursor: pointer;
-  padding: 0;
-  font-size: 13px;
-}
-
-.source-image-clear:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.history-area {
-  width: 100%;
-  border: 1px dashed #ddd;
-  border-radius: 14px;
-  padding: 10px 12px;
-  box-sizing: border-box;
-  background: #fff;
-}
-
-.history-label {
-  font-size: 12px;
-  color: #999;
-}
-
-.history-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.history-clear-btn {
-  border: none;
-  background: transparent;
-  color: #8f8f8f;
-  font-size: 12px;
-  cursor: pointer;
-  padding: 2px 4px;
-  border-radius: 6px;
-}
-
-.history-clear-btn:hover {
-  color: #4b9ef8;
-  background: #edf4ff;
-}
-
-.history-list {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.history-card {
-  position: relative;
-  width: 56px;
-  height: 56px;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: transform 0.15s ease;
-  overflow: hidden;
-}
-
-.history-card-img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.history-card:hover {
-  transform: translateY(-1px);
-}
-
-.history-item-delete-btn {
-  position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 16px;
-  height: 16px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.65);
-  color: #fff;
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.history-item-delete-btn:hover {
-  background: rgba(220, 38, 38, 0.95);
-}
-
-.prompt-input {
-  width: 100%;
-  min-height: 90px;
-  border: none;
-  outline: none;
-  font-size: 15px;
-  color: #1a1a1a;
-  resize: none;
-  background: transparent;
-  line-height: 1.6;
-  font-family: inherit;
-}
-
-.prompt-input::placeholder {
-  color: #c4c4c4;
-}
-
-.prompt-input:disabled {
-  color: #9f9f9f;
-}
-
-.textarea-wrapper {
-  position: relative;
-}
-
-.voice-btn {
-  position: absolute;
-  bottom: 8px;
-  right: 8px;
-  width: 32px;
-  height: 32px;
-  border: none;
-  background: #f5f5f5;
-  border-radius: 50%;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #666;
-  transition: all 0.2s ease;
-  padding: 0;
-}
-
-.voice-btn:hover:not(.disabled) {
-  background: #e8e8e8;
-  color: #333;
-}
-
-.voice-btn.listening {
-  background: #4b9ef8;
-  color: white;
-  box-shadow: 0 0 0 3px rgba(75, 158, 248, 0.3);
-  animation: pulse 1.5s ease-in-out infinite;
-}
-
-.voice-btn.listening:hover {
-  background: #3a8de6;
-}
-
-.voice-btn.disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.voice-btn.loading {
-  background: #e0e0e0;
-  color: #999;
-}
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.spin {
-  animation: spin 1s linear infinite;
-  display: block;
-}
-
-@keyframes pulse {
-  0%, 100% {
-    box-shadow: 0 0 0 3px rgba(75, 158, 248, 0.3);
-  }
-  50% {
-    box-shadow: 0 0 0 6px rgba(75, 158, 248, 0.15);
-  }
-}
-
-.toolbar {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.toolbar-item-wrap {
-  position: relative;
-}
-
-.toolbar-btn {
-  width: 34px;
-  height: 34px;
-  border: none;
-  background: none;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #666;
-  border-radius: 8px;
-  transition: all 0.2s;
-}
-
-.toolbar-btn:hover,
-.toolbar-btn.active {
-  color: #4b9ef8;
-  background: #ebf4ff;
-}
-
-.toolbar-text-btn {
-  height: 34px;
-  padding: 0 10px;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: 13px;
-  color: #666;
-  border-radius: 8px;
-  white-space: nowrap;
-  transition: all 0.2s;
-}
-
-.toolbar-text-btn:hover,
-.toolbar-text-btn.active {
-  color: #4b9ef8;
-  background: #ebf4ff;
-}
-
-.resolution-inputs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 8px;
-  height: 34px;
-  border-radius: 8px;
-  background: #f7f9fc;
-  border: 1px solid #e3e9f5;
-}
-
-.resolution-input {
-  width: 64px;
-  border: none;
-  background: transparent;
-  outline: none;
-  font-size: 12px;
-  color: #333;
-  text-align: center;
-}
-
-.resolution-input::-webkit-outer-spin-button,
-.resolution-input::-webkit-inner-spin-button {
-  margin: 0;
-}
-
-.resolution-sep {
-  font-size: 12px;
-  color: #8f8f8f;
-}
-
-.mode-switch {
-  display: flex;
-  gap: 2px;
-  margin-left: 4px;
-}
-
-.mode-btn.active {
-  color: #1a1a1a;
-  font-weight: 600;
-  background: #e6f0ff;
-}
-
-.generate-btn {
-  margin-left: auto;
-  width: 42px;
-  height: 42px;
-  border-radius: 50%;
-  border: none;
-  background: #1a1a1a;
-  color: #fff;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 18px;
-  flex-shrink: 0;
-  transition: background 0.2s;
-}
-
-.generate-btn:hover {
-  background: #333;
-}
-
-.generate-btn.generating {
-  background: #999;
-  cursor: not-allowed;
-}
-
-.preview-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  z-index: 30;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-}
-
-.preview-content {
-  max-width: min(100%, 920px);
-  max-height: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.preview-mask:focus {
-  outline: none;
-}
-
-.preview-carousel {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-}
-
-.preview-media {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  touch-action: pan-y;
-  user-select: none;
-}
-
-.preview-nav {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 2;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.45);
-  color: #fff;
-  font-size: 28px;
-  line-height: 1;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s;
-}
-
-.preview-nav:hover {
-  background: rgba(0, 0, 0, 0.65);
-}
-
-.preview-nav-prev {
-  left: 10px;
-}
-
-.preview-nav-next {
-  right: 10px;
-}
-
-.preview-counter {
-  text-align: center;
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.85);
-}
-
-.preview-image,
-.preview-video {
-  max-width: 100%;
-  max-height: 74vh;
-  border-radius: 14px;
-  background: #fff;
-  display: block;
-}
-
-.preview-video {
-  background: #000;
-}
-
-.history-card-video {
-  object-fit: cover;
-}
-
-.result-img-clickable {
-  cursor: zoom-in;
-}
-
-.preview-actions {
-  display: flex;
-  justify-content: center;
-  gap: 10px;
-}
-
-@media (max-width: 900px) {
-  .slogan {
-    font-size: 28px;
-    gap: 12px;
-  }
-
-  .slogan-icon {
-    width: 58px;
-    height: 58px;
-  }
-
-  .template-bar {
-    width: 100%;
-    min-width: 0;
-  }
-
-  .template-list {
-    margin-left: auto;
-  }
-
-  .mode-switch {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 4px;
-  }
-}
+.page{min-height:100vh;display:flex;background:#0a0a0b;color:#d8d2e9;font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}.icon-rail{width:88px;min-height:100vh;padding:30px 18px;display:flex;flex-direction:column;gap:34px;align-items:center;background:linear-gradient(180deg,#151516 0%,#111112 100%);border-right:1px solid rgba(255,255,255,.08)}.rail-btn{width:44px;height:44px;display:grid;place-items:center;border:0;border-radius:14px;background:transparent;color:#bdb7c9;cursor:pointer}.rail-btn svg,.mode-icon svg,.template-browse svg,.style-select svg,.composer-tool svg,.action-btn svg,.send-btn svg{width:22px;height:22px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;fill:none}.rail-btn-active{color:#221338;background:#9b6cff;box-shadow:0 0 24px rgba(155,108,255,.45)}.app-shell{flex:1;min-width:0;display:grid;grid-template-columns:472px minmax(0,1fr)}.control-panel{min-height:100vh;padding:46px 40px 40px;display:flex;flex-direction:column;gap:26px;background:radial-gradient(circle at 22% 10%,rgba(155,108,255,.12),transparent 26%),#141415;border-right:1px solid rgba(255,255,255,.1)}.brand-block{display:flex;align-items:center;gap:18px;margin-bottom:26px}.brand-mark{display:none}.brand-block h1{font-size:30px;line-height:1;color:#cfb7ff;letter-spacing:0}.brand-block p{margin-top:8px;font-size:12px;color:#777180}.panel-section{display:flex;flex-direction:column;gap:12px}.section-row{display:flex;align-items:center;justify-content:space-between}.section-label{color:#8f8998;font-size:14px;font-weight:600}.panel-divider{height:1px;background:rgba(255,255,255,.08)}.figma-mode-switch{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;padding:6px;border:1px solid rgba(255,255,255,.06);border-radius:13px;background:#0b0b0c}.mode-card{min-width:0;height:64px;border:0;border-radius:9px;background:transparent;color:#b9b3c4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;font-size:12px;cursor:pointer}.mode-card.active{color:#2a1744;background:#9b6cff;box-shadow:inset 0 0 0 1px rgba(255,255,255,.2),0 12px 24px rgba(155,108,255,.25)}.mode-more{font-size:24px}.mode-icon svg{width:18px;height:18px}.template-browse,.style-select{width:100%;height:52px;padding:0 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;color:#bdb7c9;border:1px solid rgba(255,255,255,.1);border-radius:10px;background:rgba(255,255,255,.02);cursor:pointer;font-size:15px}.style-select.active,.template-browse:hover,.style-select:hover{border-color:rgba(155,108,255,.55);background:rgba(155,108,255,.08)}.small-icon-btn{width:22px;height:22px;border:1px solid rgba(255,255,255,.24);border-radius:5px;background:transparent;color:#c8c0d8}.style-select-wrap{position:relative}.ratio-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.ratio-card{height:78px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;border:1px solid rgba(255,255,255,.1);border-radius:9px;background:rgba(255,255,255,.02);color:#bdb7c9;cursor:pointer}.ratio-card.active{border-color:rgba(155,108,255,.8);background:rgba(155,108,255,.14);color:#d6c4ff}.ratio-shape{display:block;border:3px solid currentColor;border-radius:2px}.ratio-square .ratio-shape{width:28px;height:28px}.ratio-wide .ratio-shape{width:36px;height:14px}.ratio-tall .ratio-shape{width:16px;height:34px}.ratio-classic .ratio-shape{width:34px;height:22px}.resolution-inputs{display:flex;align-items:center;width:max-content;gap:8px;padding:8px 12px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(255,255,255,.03)}.resolution-input{width:62px;border:0;outline:0;background:transparent;color:#d8d2e9;text-align:center}.resolution-sep{color:#706a78}.composer-wrap{margin-top:auto;padding:26px;min-height:276px;display:flex;flex-direction:column;gap:16px;border:1px solid rgba(255,255,255,.12);border-radius:18px;background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035));box-shadow:0 28px 80px rgba(0,0,0,.38)}.source-image-uploader{display:flex;flex-wrap:wrap;gap:10px}.source-image-input{display:none}.source-image-group,.source-image-preview-wrap,.template-chip-row{display:flex;align-items:center;gap:10px}.source-image-btn{height:34px;padding:0 12px;border:1px solid rgba(155,108,255,.45);border-radius:9px;background:rgba(155,108,255,.1);color:#d6c4ff;cursor:pointer}.source-image-preview,.template-chip img,.template-chip span{width:56px;height:56px;border-radius:8px;object-fit:cover}.source-image-clear,.template-chip button{width:22px;height:22px;border:0;border-radius:50%;background:rgba(5,8,12,.72);color:#d8d2e9;cursor:pointer}.template-chip{position:relative}.template-chip button{position:absolute;right:-7px;top:-7px}.textarea-wrapper{min-height:150px;display:flex;flex-direction:column;gap:16px}.prompt-input{flex:1;width:100%;min-height:112px;resize:none;border:0;outline:0;background:transparent;color:#d8d2e9;font:inherit;line-height:1.7}.prompt-input::placeholder{color:#716b78}.composer-actions{display:flex;align-items:center;gap:16px}.composer-tool{width:28px;height:28px;display:grid;place-items:center;border:0;background:transparent;color:#898391;cursor:pointer}.voice-btn.listening{color:#9b6cff}.send-btn{margin-left:auto;width:50px;height:50px;border:0;border-radius:50%;display:grid;place-items:center;color:#2a1744;background:#a678ff;box-shadow:0 0 32px rgba(166,120,255,.45);cursor:pointer}.send-btn.generating{background:#5e5870;color:#f4f0ff}.workspace{min-width:0;height:100vh;display:flex;flex-direction:column;background:radial-gradient(circle at 30% 18%,rgba(155,108,255,.08),transparent 32%),#080809}.chat-area{flex:1;min-height:0;overflow-y:auto;padding:40px 42px 24px;display:flex;flex-direction:column;gap:28px}.assistant-intro,.chat-row.role-assistant{display:grid;grid-template-columns:52px minmax(0,1fr);gap:18px;align-items:start;max-width:1000px}.chat-row.role-user{display:flex;justify-content:flex-end}.bot-avatar{width:52px;height:52px;border-radius:15px;display:grid;place-items:center;background:#9b6cff;box-shadow:0 0 28px rgba(155,108,255,.35)}.bot-avatar img{width:30px;height:30px}.intro-card,.chat-bubble{border:1px solid rgba(255,255,255,.12);border-radius:16px;background:rgba(255,255,255,.025);color:#c8c3ce}.intro-card{padding:28px;font-size:17px}.empty-chat{max-width:900px;margin-left:70px;padding:26px 30px;border:1px solid rgba(155,108,255,.38);border-radius:16px;background:rgba(72,62,91,.68);color:#d4cedc;line-height:1.8;font-size:16px}.chat-bubble{max-width:min(100%,900px);padding:26px}.chat-row.role-user .chat-bubble{background:rgba(155,108,255,.2);border-color:rgba(155,108,255,.42)}.chat-meta{display:flex;justify-content:space-between;gap:14px;margin-bottom:12px;font-size:12px;color:#8d8794}.message-delete-btn,.history-clear-btn{border:0;background:transparent;color:#8d8794;cursor:pointer}.chat-text{color:#e3ddea;line-height:1.8;white-space:pre-wrap}.user-images{display:flex;gap:10px;margin-bottom:14px}.user-source-image{width:120px;height:120px;border-radius:12px;object-fit:cover;border:1px solid rgba(255,255,255,.12)}.result-shell{padding:24px;border:1px solid rgba(255,255,255,.08);border-radius:16px;background:rgba(255,255,255,.02)}.result-img,.result-video{width:100%;max-height:520px;object-fit:contain;display:block;border-radius:12px;background:#020203}.result-img-clickable{cursor:zoom-in}.generating-tip,.error-tip{color:#d6c4ff}.result-actions,.preview-actions{display:flex;gap:12px;margin-top:16px}.action-btn{min-height:44px;padding:0 18px;display:inline-flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.03);color:#d8d2e9;cursor:pointer}.action-btn svg{width:18px;height:18px}.history-area{border-top:1px solid rgba(255,255,255,.08);padding:14px 42px 20px;background:rgba(255,255,255,.015)}.history-header{display:flex;justify-content:space-between;margin-bottom:12px;color:#8d8794;font-size:13px}.history-list{display:flex;gap:10px;overflow-x:auto}.history-card{position:relative;width:72px;height:72px;flex:0 0 auto;overflow:hidden;border-radius:12px;cursor:pointer;border:1px solid rgba(255,255,255,.1)}.history-card-img{width:100%;height:100%;object-fit:cover}.history-item-delete-btn{position:absolute;right:4px;top:4px;width:20px;height:20px;border:0;border-radius:50%;color:#fff;background:rgba(0,0,0,.65)}.preview-mask{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:28px;background:rgba(0,0,0,.78)}.preview-content{max-width:min(100%,1080px);max-height:100%;display:flex;flex-direction:column;gap:12px}.preview-carousel{position:relative;display:flex;align-items:center;justify-content:center}.preview-media{display:flex;align-items:center;justify-content:center}.preview-image,.preview-video{max-width:100%;max-height:78vh;border-radius:16px;background:#050506}.preview-nav{position:absolute;top:50%;transform:translateY(-50%);z-index:2;width:44px;height:44px;border:0;border-radius:50%;background:rgba(255,255,255,.12);color:#fff;font-size:32px;cursor:pointer}.preview-nav-prev{left:14px}.preview-nav-next{right:14px}.preview-counter{text-align:center;color:rgba(255,255,255,.72)}@media(max-width:1100px){.app-shell{grid-template-columns:1fr}.control-panel{min-height:auto;border-right:0;border-bottom:1px solid rgba(255,255,255,.1)}.workspace{height:auto;min-height:70vh}}@media(max-width:760px){.page{display:block;overflow:auto}.icon-rail{width:100%;min-height:auto;flex-direction:row;justify-content:center;padding:14px}.control-panel{padding:24px 16px}.figma-mode-switch,.ratio-grid{grid-template-columns:repeat(2,1fr)}.chat-area{padding:24px 16px}.assistant-intro,.chat-row.role-assistant{grid-template-columns:42px minmax(0,1fr)}.bot-avatar{width:42px;height:42px}.empty-chat{margin-left:0}}
+.bot-avatar{color:#340080}.bot-avatar svg{width:30px;height:30px}
+:deep(.figma-icon){stroke:none!important;stroke-width:0!important;stroke-linecap:initial!important;stroke-linejoin:initial!important;fill:none!important}
+:deep(.figma-icon path){stroke:none!important;fill:currentColor!important}
+.rail-btn{color:#CBC3D7}.rail-btn-active{color:#340080}
+.composer-wrap{position:relative;padding:22px 24px 20px;border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.035)),#202021;border-color:rgba(255,255,255,.14);box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 30px 80px rgba(0,0,0,.42)}
+.template-chip-row{align-items:flex-start;gap:12px;min-height:72px}
+.template-chip,.source-image-preview-wrap{position:relative;width:72px;height:72px;padding:3px;border-radius:14px;background:linear-gradient(145deg,rgba(255,255,255,.18),rgba(255,255,255,.035));border:1px solid rgba(255,255,255,.13);box-shadow:0 12px 28px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.11);overflow:hidden}
+.template-chip::after,.source-image-preview-wrap::after{content:"";position:absolute;inset:3px;border-radius:11px;background:linear-gradient(135deg,rgba(255,255,255,.16),transparent 38%,rgba(0,0,0,.16));pointer-events:none}
+.template-chip img,.template-chip span,.source-image-preview{width:100%;height:100%;border-radius:11px;object-fit:cover;display:block}
+.template-chip span{background:linear-gradient(135deg,#20343b,#758489)!important}
+.template-chip button,.source-image-clear{position:absolute;right:5px;top:5px;z-index:2;width:22px;height:22px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.12);background:rgba(10,10,15,.78);color:#e7e1f2;box-shadow:0 8px 18px rgba(0,0,0,.32);backdrop-filter:blur(10px)}
+.template-chip button svg,.source-image-clear svg{width:8px;height:8px}
+.template-chip:hover,.source-image-preview-wrap:hover{border-color:rgba(208,188,255,.42);box-shadow:0 16px 34px rgba(0,0,0,.34),0 0 0 1px rgba(155,108,255,.16),inset 0 1px 0 rgba(255,255,255,.12)}
+.textarea-wrapper{min-height:132px}.prompt-input{min-height:92px}
+.page{position:relative;background:linear-gradient(135deg,#08090a 0%,#101012 42%,#07080a 100%);color:#eee9f7}
+.page::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(115deg,rgba(122,220,255,.055),transparent 34%,rgba(208,188,255,.045) 68%,transparent);background-size:56px 56px,56px 56px,100% 100%;mask-image:linear-gradient(90deg,transparent 0%,#000 18%,#000 84%,transparent 100%);opacity:.34}
+.icon-rail,.app-shell{position:relative;z-index:1}
+.icon-rail{background:linear-gradient(180deg,#171719 0%,#101113 45%,#0b0c0e 100%);border-right:1px solid rgba(255,255,255,.09);box-shadow:inset -1px 0 0 rgba(255,255,255,.035),18px 0 70px rgba(0,0,0,.34)}
+.rail-btn{transition:transform .18s ease,background .18s ease,color .18s ease,box-shadow .18s ease}
+.rail-btn:hover{transform:translateY(-1px);background:rgba(255,255,255,.055);box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+.rail-btn-active{background:linear-gradient(145deg,#b787ff 0%,#8f63ff 100%);box-shadow:0 16px 34px rgba(122,84,228,.34),inset 0 1px 0 rgba(255,255,255,.35),inset 0 -12px 24px rgba(52,0,128,.13)}
+.control-panel{background:linear-gradient(180deg,rgba(24,24,26,.96),rgba(17,18,20,.96)),linear-gradient(130deg,rgba(116,230,255,.05),transparent 38%,rgba(174,131,255,.08));box-shadow:inset -1px 0 0 rgba(255,255,255,.045),24px 0 90px rgba(0,0,0,.35)}
+.brand-block{margin-bottom:18px}.brand-block h1{font-weight:800;color:#d8c4ff;text-shadow:0 0 26px rgba(155,108,255,.22)}.brand-block p{color:#8d8795}
+.section-label{display:flex;align-items:center;gap:8px;color:#aaa2b3;font-size:13px}
+.panel-section{position:relative}
+.section-label::before{content:"";width:5px;height:5px;border-radius:50%;background:#75d8ea;box-shadow:0 0 14px rgba(117,216,234,.45)}
+.figma-mode-switch{background:linear-gradient(180deg,rgba(0,0,0,.34),rgba(255,255,255,.025));border-color:rgba(255,255,255,.095);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.mode-card{transition:transform .18s ease,background .18s ease,color .18s ease,box-shadow .18s ease}
+.mode-card:hover{transform:translateY(-1px);background:rgba(255,255,255,.055);color:#e4ddf1}
+.mode-card.active{background:linear-gradient(145deg,#b188ff,#8e63ff);box-shadow:0 14px 30px rgba(141,98,255,.25),inset 0 1px 0 rgba(255,255,255,.34);color:#2c164b}
+.template-browse,.style-select,.ratio-card,.resolution-inputs{background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.018));border-color:rgba(255,255,255,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.055)}
+.template-browse:hover,.style-select:hover,.style-select.active,.ratio-card:hover{border-color:rgba(117,216,234,.34);background:linear-gradient(180deg,rgba(117,216,234,.07),rgba(155,108,255,.035));box-shadow:0 12px 28px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.07)}
+.ratio-card{transition:transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease}.ratio-card:hover{transform:translateY(-1px)}.ratio-card.active{background:linear-gradient(180deg,rgba(155,108,255,.18),rgba(117,216,234,.055));border-color:rgba(208,188,255,.72);box-shadow:0 12px 28px rgba(96,66,170,.18),inset 0 1px 0 rgba(255,255,255,.09)}
+.small-icon-btn,.composer-tool,.message-delete-btn,.history-clear-btn,.history-item-delete-btn{transition:transform .16s ease,background .16s ease,color .16s ease,border-color .16s ease}
+.small-icon-btn:hover,.composer-tool:hover,.message-delete-btn:hover,.history-clear-btn:hover,.history-item-delete-btn:hover{transform:translateY(-1px);color:#f0eaff;background:rgba(255,255,255,.07)}
+.composer-wrap{background:linear-gradient(180deg,rgba(255,255,255,.095),rgba(255,255,255,.035)),linear-gradient(135deg,rgba(117,216,234,.055),transparent 42%,rgba(166,120,255,.075));border-color:rgba(255,255,255,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 34px 100px rgba(0,0,0,.48)}
+.composer-wrap::before{content:"";position:absolute;left:18px;right:18px;top:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.3),transparent)}
+.prompt-input{color:#f0eaf7;font-size:14px}.prompt-input::placeholder{color:#8f8796}.composer-actions{border-top:1px solid rgba(255,255,255,.06);padding-top:10px}
+.source-image-btn{background:linear-gradient(180deg,rgba(155,108,255,.16),rgba(117,216,234,.055));border-color:rgba(208,188,255,.32);box-shadow:inset 0 1px 0 rgba(255,255,255,.08);transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}.source-image-btn:hover{transform:translateY(-1px);border-color:rgba(117,216,234,.42);box-shadow:0 12px 24px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.1)}
+.send-btn{background:linear-gradient(145deg,#b787ff,#9e6aff 58%,#73d4e8);box-shadow:0 18px 40px rgba(155,108,255,.33),0 0 0 1px rgba(255,255,255,.1),inset 0 1px 0 rgba(255,255,255,.42);transition:transform .18s ease,box-shadow .18s ease}.send-btn:hover{transform:translateY(-2px) scale(1.02);box-shadow:0 22px 46px rgba(155,108,255,.42),0 0 0 1px rgba(255,255,255,.13),inset 0 1px 0 rgba(255,255,255,.46)}
+.workspace{background:linear-gradient(180deg,rgba(14,15,17,.98),rgba(6,7,8,.99)),linear-gradient(120deg,rgba(117,216,234,.04),transparent 38%,rgba(155,108,255,.06));box-shadow:inset 1px 0 0 rgba(255,255,255,.035)}
+.chat-area{scrollbar-width:thin;scrollbar-color:rgba(208,188,255,.34) transparent}.chat-area::-webkit-scrollbar,.history-list::-webkit-scrollbar{height:8px;width:8px}.chat-area::-webkit-scrollbar-thumb,.history-list::-webkit-scrollbar-thumb{background:rgba(208,188,255,.28);border-radius:99px}.chat-area::-webkit-scrollbar-track,.history-list::-webkit-scrollbar-track{background:transparent}
+.bot-avatar{background:linear-gradient(145deg,#b487ff,#8e63ff);box-shadow:0 18px 34px rgba(134,92,255,.28),inset 0 1px 0 rgba(255,255,255,.35)}
+.intro-card,.chat-bubble{background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.022));border-color:rgba(255,255,255,.13);box-shadow:0 20px 60px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(14px)}
+.chat-row.role-user .chat-bubble{background:linear-gradient(180deg,rgba(119,93,166,.38),rgba(69,62,91,.48));border-color:rgba(208,188,255,.4)}
+.empty-chat{background:linear-gradient(180deg,rgba(82,73,101,.72),rgba(48,45,58,.7));border-color:rgba(208,188,255,.32);box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 20px 54px rgba(0,0,0,.2)}
+.result-shell{padding:18px;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(0,0,0,.2));border-color:rgba(255,255,255,.11);box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 18px 48px rgba(0,0,0,.28)}
+.result-img,.result-video{border-radius:10px;box-shadow:0 20px 60px rgba(0,0,0,.42)}
+.action-btn{background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.022));border-color:rgba(255,255,255,.14);box-shadow:inset 0 1px 0 rgba(255,255,255,.06);transition:transform .16s ease,border-color .16s ease,background .16s ease}.action-btn:hover{transform:translateY(-1px);border-color:rgba(117,216,234,.36);background:linear-gradient(180deg,rgba(117,216,234,.08),rgba(255,255,255,.03))}
+.history-area{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(0,0,0,.04));box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}.history-card{border-color:rgba(255,255,255,.13);box-shadow:0 12px 30px rgba(0,0,0,.25);transition:transform .16s ease,border-color .16s ease}.history-card:hover{transform:translateY(-2px);border-color:rgba(117,216,234,.36)}
+.history-item-delete-btn{top:6px;right:6px;width:26px;height:26px;display:grid;place-items:center;padding:0;line-height:1;border-radius:50%}
+.history-item-delete-btn svg{width:10px!important;height:10px!important}
+.preview-mask{background:rgba(0,0,0,.78);backdrop-filter:blur(18px)}.preview-image,.preview-video{box-shadow:0 34px 100px rgba(0,0,0,.58);border:1px solid rgba(255,255,255,.1)}.preview-nav{background:rgba(22,23,27,.72);border:1px solid rgba(255,255,255,.12);backdrop-filter:blur(12px)}
+.composer-wrap{margin-bottom:14px}
+.composer-actions{min-height:52px;align-items:center}
+.composer-tool:first-child{margin-left:0}
+.rail-top,.rail-bottom{display:flex;flex-direction:column;align-items:center;gap:34px}
+.rail-bottom{margin-top:auto}
+.icon-rail{z-index:20}
+.settings-popover{position:fixed;left:104px;bottom:28px;z-index:80;width:min(380px,calc(100vw - 132px));padding:22px;border:1px solid rgba(255,255,255,.16);border-radius:16px;background:linear-gradient(180deg,rgba(33,34,38,.98),rgba(16,17,20,.98));box-shadow:0 28px 90px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.08);backdrop-filter:blur(18px)}
+.settings-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}
+.settings-header h2{margin:0;color:#f1ebff;font-size:20px;line-height:1.2;letter-spacing:0}
+.settings-header p{margin:6px 0 0;color:#91899d;font-size:13px}
+.settings-close{width:30px;height:30px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:rgba(255,255,255,.04);color:#cbc3d7;cursor:pointer}
+.settings-close svg{width:10px;height:10px}
+.settings-field{display:flex;flex-direction:column;gap:8px;margin-top:14px;color:#b9b2c5;font-size:13px}
+.settings-field input{height:42px;width:100%;box-sizing:border-box;border:1px solid rgba(255,255,255,.13);border-radius:10px;background:rgba(0,0,0,.24);color:#f0eaf7;outline:0;padding:0 12px;font:inherit}
+.settings-field input:focus{border-color:rgba(117,216,234,.45);box-shadow:0 0 0 3px rgba(117,216,234,.1)}
+.settings-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+.settings-primary,.settings-secondary{min-height:38px;padding:0 14px;border-radius:10px;cursor:pointer;font-weight:700}
+.settings-primary{border:0;background:linear-gradient(145deg,#b787ff,#73d4e8);color:#24123e}
+.settings-secondary{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#d8d2e9}
+.settings-status{margin:12px 2px 0;color:#75d8ea;font-size:12px}
+.speech-error{margin:0;color:#ffb4ab;font-size:12px;line-height:1.45}
+.template-library-panel{position:absolute;left:0;right:0;top:calc(100% + 10px);z-index:60;padding:14px;border:1px solid rgba(255,255,255,.16);border-radius:14px;background:linear-gradient(180deg,rgba(33,34,38,.98),rgba(16,17,20,.98));box-shadow:0 24px 70px rgba(0,0,0,.46),inset 0 1px 0 rgba(255,255,255,.08);backdrop-filter:blur(18px)}
+.template-library-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;color:#f0eaff;font-size:13px;font-weight:700}
+.template-library-header button{width:26px;height:26px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:rgba(255,255,255,.04);color:#cbc3d7;cursor:pointer}
+.template-library-header svg{width:9px;height:9px}
+.template-library-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;max-height:260px;overflow:auto;padding-right:2px}
+.template-library-item{aspect-ratio:1;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:linear-gradient(145deg,rgba(255,255,255,.15),rgba(255,255,255,.035));padding:3px;cursor:pointer;overflow:hidden;box-shadow:0 10px 24px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.08)}
+.template-library-item:hover{border-color:rgba(117,216,234,.4);box-shadow:0 14px 30px rgba(0,0,0,.28),0 0 0 1px rgba(155,108,255,.16),inset 0 1px 0 rgba(255,255,255,.1)}
+.template-library-item img,.template-library-item span{width:100%;height:100%;border-radius:9px;object-fit:cover;display:block}
+.page{--rail-width:88px;--panel-width:clamp(380px,36vw,472px);--panel-pad-x:clamp(22px,3vw,40px);--composer-height:clamp(216px,34vh,276px);height:100dvh;min-height:0}
+.icon-rail{flex:0 0 var(--rail-width);min-height:100dvh}
+.app-shell{height:100dvh;min-height:0;grid-template-columns:var(--panel-width) minmax(0,1fr)}
+.control-panel{height:100dvh;min-height:0;overflow:hidden;padding:clamp(24px,4.2vh,46px) var(--panel-pad-x) 10px;gap:clamp(12px,1.8vh,18px)}
+.controls-scroll{min-height:0;overflow:auto;display:flex;flex:1 1 auto;flex-direction:column;gap:clamp(14px,2.2vh,26px);padding-right:4px;scrollbar-width:thin;scrollbar-color:rgba(208,188,255,.34) transparent}
+.controls-scroll::-webkit-scrollbar{width:8px}.controls-scroll::-webkit-scrollbar-thumb{background:rgba(208,188,255,.28);border-radius:99px}.controls-scroll::-webkit-scrollbar-track{background:transparent}
+.composer-wrap{position:relative;left:auto;right:auto;bottom:auto;z-index:1;width:100%;margin-top:0;margin-bottom:0;flex:0 0 auto;min-height:var(--composer-height);padding:clamp(18px,2.4vh,22px) clamp(18px,2.6vw,24px) clamp(12px,1.8vh,18px)}
+.textarea-wrapper{flex:1 1 auto;min-height:clamp(116px,22vh,132px);gap:clamp(10px,1.8vh,16px)}
+.prompt-input{min-height:clamp(76px,16vh,92px)}
+.composer-actions{margin-top:auto;min-height:clamp(44px,8vh,52px);padding-top:8px}
+.asset-library{position:relative;z-index:10;flex:0 0 clamp(220px,18vw,268px);height:100dvh;min-height:0;display:flex;flex-direction:column;gap:16px;padding:28px 18px 22px;background:linear-gradient(180deg,rgba(22,23,26,.98),rgba(12,13,15,.98)),linear-gradient(135deg,rgba(117,216,234,.045),transparent 42%,rgba(166,120,255,.065));border-right:1px solid rgba(255,255,255,.09);box-shadow:inset -1px 0 0 rgba(255,255,255,.035),18px 0 70px rgba(0,0,0,.28)}
+.asset-library-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.asset-library-header h2{margin:0;color:#f0eaff;font-size:20px;line-height:1.15;letter-spacing:0}
+.asset-library-header p{margin:7px 0 0;color:#8f8798;font-size:12px;line-height:1.4}
+.asset-clear-btn{flex:0 0 auto;min-height:30px;padding:0 10px;border:1px solid rgba(255,255,255,.13);border-radius:8px;background:rgba(255,255,255,.04);color:#c9c1d8;font-size:12px;cursor:pointer;transition:transform .16s ease,background .16s ease,color .16s ease,border-color .16s ease}
+.asset-clear-btn:hover{transform:translateY(-1px);border-color:rgba(117,216,234,.32);background:rgba(117,216,234,.08);color:#f0eaff}
+.asset-section-title{display:flex;align-items:center;gap:8px;color:#aaa2b3;font-size:13px;font-weight:700}
+.asset-section-title::before{content:"";width:5px;height:5px;border-radius:50%;background:#75d8ea;box-shadow:0 0 14px rgba(117,216,234,.45)}
+.asset-grid{min-height:0;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;gap:10px;padding-right:3px;scrollbar-width:thin;scrollbar-color:rgba(208,188,255,.34) transparent}
+.asset-grid::-webkit-scrollbar{width:8px;height:8px}.asset-grid::-webkit-scrollbar-thumb{background:rgba(208,188,255,.28);border-radius:99px}.asset-grid::-webkit-scrollbar-track{background:transparent}
+.asset-card{position:relative;aspect-ratio:1;min-width:0;overflow:hidden;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:linear-gradient(145deg,rgba(255,255,255,.15),rgba(255,255,255,.035));box-shadow:0 12px 30px rgba(0,0,0,.24),inset 0 1px 0 rgba(255,255,255,.08);cursor:pointer;outline:0;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease}
+.asset-card:hover,.asset-card:focus-visible{transform:translateY(-2px);border-color:rgba(117,216,234,.4);box-shadow:0 16px 34px rgba(0,0,0,.3),0 0 0 1px rgba(155,108,255,.16),inset 0 1px 0 rgba(255,255,255,.1)}
+.asset-card-media{width:100%;height:100%;object-fit:cover;display:block}
+.asset-card-shade{position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.02),transparent 45%,rgba(0,0,0,.26));pointer-events:none}
+.asset-type-badge{position:absolute;left:7px;bottom:7px;z-index:2;min-height:20px;padding:0 7px;display:inline-flex;align-items:center;border-radius:7px;background:rgba(8,9,12,.72);color:#f0eaff;font-size:11px;line-height:1;backdrop-filter:blur(10px)}
+.asset-delete-btn{position:absolute;right:6px;top:6px;z-index:3;width:26px;height:26px;display:grid;place-items:center;padding:0;border:1px solid rgba(255,255,255,.12);border-radius:50%;background:rgba(10,10,15,.78);color:#e7e1f2;box-shadow:0 8px 18px rgba(0,0,0,.32);backdrop-filter:blur(10px);cursor:pointer;transition:transform .16s ease,background .16s ease,color .16s ease,border-color .16s ease}
+.asset-delete-btn:hover{transform:translateY(-1px);border-color:rgba(117,216,234,.34);background:rgba(255,255,255,.09);color:#fff}
+.asset-delete-btn svg{width:10px!important;height:10px!important}
+.asset-empty{min-height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;border:1px dashed rgba(255,255,255,.14);border-radius:14px;background:rgba(255,255,255,.025);color:#8f8798;font-size:13px}
+.asset-empty svg{width:26px;height:26px}
+.asset-page{position:relative;z-index:1;flex:1;min-width:0;height:100dvh;overflow:auto;padding:clamp(28px,4vw,54px);background:linear-gradient(180deg,rgba(14,15,17,.98),rgba(6,7,8,.99)),linear-gradient(120deg,rgba(117,216,234,.04),transparent 38%,rgba(155,108,255,.06));box-shadow:inset 1px 0 0 rgba(255,255,255,.035);scrollbar-width:thin;scrollbar-color:rgba(208,188,255,.34) transparent}
+.asset-page::-webkit-scrollbar{width:8px}.asset-page::-webkit-scrollbar-thumb{background:rgba(208,188,255,.28);border-radius:99px}.asset-page::-webkit-scrollbar-track{background:transparent}
+.asset-page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:30px}
+.asset-page-header h1{margin:0;color:#f0eaff;font-size:30px;line-height:1.1;letter-spacing:0}
+.asset-page-header p{margin:9px 0 0;color:#91899d;font-size:13px}
+.asset-page-section{display:flex;flex-direction:column;gap:16px}
+.asset-page-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px;align-content:start}
+.asset-page .asset-card{min-height:150px}
+.asset-page .asset-empty{min-height:320px}
+@media(max-width:1180px){.asset-library{flex-basis:210px;padding:24px 14px 18px}.asset-grid{grid-template-columns:1fr}.page{--panel-width:clamp(340px,35vw,400px)}}
+@media(max-height:680px){
+  .page{--composer-height:198px}
+  .control-panel{padding-top:20px;gap:10px}
+  .controls-scroll{gap:12px}
+  .brand-block{margin-bottom:8px}
+  .panel-section{gap:8px}
+  .figma-mode-switch{gap:4px;padding:4px}
+  .mode-card{height:52px}
+  .ratio-card{height:62px}
+  .template-browse,.style-select{height:44px}
+  .textarea-wrapper{min-height:104px}
+  .prompt-input{min-height:68px}
+  .composer-actions{min-height:42px}
+}
+@media(min-width:761px) and (max-width:980px){
+  .page{--panel-width:clamp(360px,45vw,410px)}
+  .app-shell{grid-template-columns:var(--panel-width) minmax(0,1fr)}
+  .control-panel{border-right:1px solid rgba(255,255,255,.1);border-bottom:0}
+  .workspace{height:100dvh;min-height:0}
+  .chat-area{padding:28px 24px 18px}
+  .intro-card,.chat-bubble{padding:20px}
+}
+@media(max-width:760px){
+  .page{--rail-width:0px;--panel-width:100vw;--panel-pad-x:16px;--composer-height:200px;height:auto;min-height:100dvh;overflow:auto}
+  .icon-rail{min-height:auto;flex:0 0 auto}
+  .asset-library{width:100%;height:auto;min-height:0;padding:12px 16px 14px;border-right:0;border-bottom:1px solid rgba(255,255,255,.09);box-shadow:inset 0 -1px 0 rgba(255,255,255,.035),0 18px 50px rgba(0,0,0,.22)}
+  .asset-library-header h2{font-size:18px}.asset-library-header p{margin-top:4px}
+  .asset-grid{display:flex;grid-template-columns:none;overflow-x:auto;overflow-y:hidden;padding-bottom:2px;padding-right:0}
+  .asset-card{flex:0 0 92px;width:92px}
+  .asset-empty{min-height:74px;flex-direction:row}
+  .asset-page{height:auto;min-height:calc(100dvh - 72px);padding:22px 16px 28px}
+  .asset-page-header{margin-bottom:22px}
+  .asset-page-header h1{font-size:24px}
+  .asset-page-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .asset-page .asset-card{width:auto;min-height:0;flex:auto}
+  .asset-page .asset-empty{min-height:220px;flex-direction:column}
+  .app-shell{height:auto;grid-template-columns:1fr}
+  .control-panel{height:calc(100dvh - 72px);min-height:0;padding:20px 16px 8px;overflow:hidden}
+  .composer-wrap{left:auto;right:auto;width:100%;bottom:auto;min-height:var(--composer-height);border-radius:18px}
+  .textarea-wrapper{min-height:108px}
+  .prompt-input{min-height:72px}
+}
+@media(max-width:760px){.rail-top,.rail-bottom{flex-direction:row;gap:18px}.rail-bottom{margin-top:0;margin-left:auto}.settings-popover{left:16px;right:16px;bottom:82px;width:auto}}
 </style>
