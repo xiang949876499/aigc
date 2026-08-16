@@ -107,3 +107,9 @@ npm run check:speech
 5. FunASR CLI 是否可在系统 PATH 或 FUNASR_CLI 指定位置运行。
 
 详细语音说明见 docs/voice-recognition.md。
+
+## 许可与第三方声明 / License & third-party notices
+
+本仓库维护者的原创贡献采用[学习与非商业使用许可](./LICENSE)：个人学习与非商业研究可免费使用；任何商业使用均须先获得著作权人的书面授权。第三方依赖、模型、素材、数据与服务仍适用各自的许可证或条款，详见[第三方声明](./THIRD_PARTY_NOTICES.md)。
+
+商业授权请通过本仓库的 GitHub Issues，或 [维护者主页](https://github.com/xiang949876499) 联系。
